@@ -34,3 +34,6 @@ clips/
 build/
 dist/
 *.spec
+
+# App logs
+security_camera_app.log
