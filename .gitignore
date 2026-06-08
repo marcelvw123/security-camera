@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Generated media
+clips/
+*.mp4
+*.avi
+*.mov
+
+# Model weights and large artifacts
+*.pt
+*.onnx
+*.engine
+
+# PyInstaller
+build/
+dist/
+*.spec
