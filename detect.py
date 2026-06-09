@@ -1,5 +1,6 @@
 import sys
 import logging
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -13,15 +14,14 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QGridLayout,
-    QHBoxLayout,
+    QCheckBox,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -29,15 +29,19 @@ from ultralytics import YOLO
 
 MIN_MOTION_AREA = 1000
 CLIP_SECONDS = 10
-OUTPUT_DIR = Path("clips")
-TARGET_OBJECTS = {"car"}
+YOLO_MODEL_FILENAME = "yolo11s.pt"
+YOLO_CONFIDENCE = 0.55
+OUTPUT_DIR = Path.home() / "SecurityCamera" / "clips"
+DEFAULT_TARGET_OBJECTS = {"car"}
+AVAILABLE_TARGET_OBJECTS = ("car", "person")
 DEFAULT_RTSP_PORT = "554"
 CHANNEL_SCAN_LIMIT = 16
 STREAM_OPEN_TIMEOUT_MS = 1200
 STREAM_READ_TIMEOUT_MS = 1200
+STREAM_RECONNECT_DELAY_SECONDS = 2
+READ_FAILURES_BEFORE_RECONNECT = 3
 PREVIEW_EVERY_N_FRAMES = 3
 JPEG_PREVIEW_QUALITY = 70
-PREVIEW_COLUMNS = 4
 LOG_FILE = Path("security_camera_app.log")
 
 
@@ -97,11 +101,12 @@ class CameraDetectionWorker(QObject):
     finished = Signal(str)
     frame_ready = Signal(str, bytes)
 
-    def __init__(self, channel, rtsp_url, window_title):
+    def __init__(self, channel, rtsp_url, window_title, target_objects):
         super().__init__()
         self.channel = channel
         self.rtsp_url = rtsp_url
         self.window_title = window_title
+        self.target_objects = target_objects
         self._stopped = False
 
     def stop(self):
@@ -112,6 +117,7 @@ class CameraDetectionWorker(QObject):
             run_detection(
                 self.rtsp_url,
                 self.window_title,
+                self.target_objects,
                 self.should_stop,
                 self.emit_frame,
             )
@@ -128,16 +134,55 @@ class CameraDetectionWorker(QObject):
         self.frame_ready.emit(self.channel, frame_bytes)
 
 
+class StreamPreviewWindow(QWidget):
+    close_requested = Signal(str)
+
+    def __init__(self, channel, label):
+        super().__init__()
+        self.channel = channel
+        self.setWindowTitle(label)
+        self.resize(720, 420)
+
+        self.preview = QLabel(f"Starting {label}...")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(160, 90)
+        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview.setStyleSheet("background: #111827; color: white;")
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.preview)
+        self.setLayout(layout)
+
+    def update_frame(self, frame_bytes):
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(frame_bytes, "JPG"):
+            return
+
+        self.preview.setPixmap(
+            pixmap.scaled(
+                self.preview.width(),
+                max(self.preview.height(), 1),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+
+    def closeEvent(self, event):
+        self.close_requested.emit(self.channel)
+        super().closeEvent(event)
+
+
 class CameraSettingsDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Security Camera Setup")
-        self.setMinimumSize(1200, 720)
+        self.setMinimumSize(520, 560)
 
         self.scan_thread = None
         self.scan_worker = None
         self.stream_workers = {}
-        self.preview_labels = {}
+        self.preview_windows = {}
 
         self.username_input = QLineEdit()
         self.password_input = QLineEdit()
@@ -145,6 +190,13 @@ class CameraSettingsDialog(QDialog):
         self.ip_input = QLineEdit()
         self.port_input = QLineEdit(DEFAULT_RTSP_PORT)
         self.manual_channel_input = QLineEdit()
+        self.object_checkboxes = {}
+
+        for object_name in AVAILABLE_TARGET_OBJECTS:
+            checkbox = QCheckBox(object_name.title())
+            checkbox.setChecked(object_name in DEFAULT_TARGET_OBJECTS)
+            self.object_checkboxes[object_name] = checkbox
+
         self.camera_list = QListWidget()
         self.camera_list.setMinimumHeight(180)
         self.camera_list.itemChanged.connect(self.toggle_stream)
@@ -153,8 +205,6 @@ class CameraSettingsDialog(QDialog):
         self.scan_button.clicked.connect(self.scan_cameras)
         self.add_manual_button = QPushButton("Add Manual Channel")
         self.add_manual_button.clicked.connect(self.add_manual_channel)
-        self.preview_layout = QGridLayout()
-        self.preview_layout.setSpacing(10)
 
         form = QFormLayout()
         form.addRow("Username", self.username_input)
@@ -162,39 +212,19 @@ class CameraSettingsDialog(QDialog):
         form.addRow("DVR/NVR IP", self.ip_input)
         form.addRow("RTSP Port", self.port_input)
         form.addRow("Manual Channel", self.manual_channel_input)
+        for object_name, checkbox in self.object_checkboxes.items():
+            form.addRow("Record Objects", checkbox)
         form.addRow("", self.scan_button)
         form.addRow("", self.add_manual_button)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
 
-        left_panel = QVBoxLayout()
-        left_panel.addLayout(form)
-        left_panel.addWidget(self.scan_status)
-        left_panel.addWidget(self.camera_list)
-        left_panel.addWidget(buttons)
-
-        left_widget = QWidget()
-        left_widget.setLayout(left_panel)
-        left_widget.setFixedWidth(380)
-
-        preview_container = QWidget()
-        preview_container.setLayout(self.preview_layout)
-
-        preview_scroll = QScrollArea()
-        preview_scroll.setWidgetResizable(True)
-        preview_scroll.setWidget(preview_container)
-
-        right_panel = QVBoxLayout()
-        right_panel.addWidget(QLabel("Camera Previews"))
-        right_panel.addWidget(preview_scroll)
-
-        right_widget = QWidget()
-        right_widget.setLayout(right_panel)
-
-        layout = QHBoxLayout()
-        layout.addWidget(left_widget)
-        layout.addWidget(right_widget, 1)
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(self.scan_status)
+        layout.addWidget(self.camera_list)
+        layout.addWidget(buttons)
         self.setLayout(layout)
 
     def reject(self):
@@ -220,6 +250,13 @@ class CameraSettingsDialog(QDialog):
             "password": self.password_input.text(),
             "ip_address": self.ip_input.text().strip(),
             "port": self.port_input.text().strip(),
+        }
+
+    def selected_target_objects(self):
+        return {
+            object_name
+            for object_name, checkbox in self.object_checkboxes.items()
+            if checkbox.isChecked()
         }
 
     def scan_cameras(self):
@@ -319,6 +356,7 @@ class CameraSettingsDialog(QDialog):
             return
 
         settings = self.settings()
+        target_objects = self.selected_target_objects()
         if not all(settings.values()):
             QMessageBox.warning(
                 self,
@@ -330,9 +368,20 @@ class CameraSettingsDialog(QDialog):
             self.camera_list.blockSignals(False)
             return
 
+        if not target_objects:
+            QMessageBox.warning(
+                self,
+                "Missing Objects",
+                "Select at least one object to record.",
+            )
+            self.camera_list.blockSignals(True)
+            item.setCheckState(Qt.Unchecked)
+            self.camera_list.blockSignals(False)
+            return
+
         rtsp_url = build_rtsp_url(settings, channel=channel)
         thread = QThread(self)
-        worker = CameraDetectionWorker(channel, rtsp_url, label)
+        worker = CameraDetectionWorker(channel, rtsp_url, label, target_objects)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -341,13 +390,15 @@ class CameraSettingsDialog(QDialog):
         worker.finished.connect(self.finish_stream)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda channel=channel: self.cleanup_stream_thread(channel))
         thread.finished.connect(thread.deleteLater)
 
         self.stream_workers[channel] = {
             "thread": thread,
             "worker": worker,
+            "stopping": False,
         }
-        self.add_preview(channel, label)
+        self.add_preview_window(channel, label)
         self.scan_status.setText(f"Started stream {channel}.")
         thread.start()
 
@@ -356,26 +407,29 @@ class CameraSettingsDialog(QDialog):
         if not stream:
             return
 
+        stream["stopping"] = True
         stream["worker"].stop()
         self.scan_status.setText(f"Stopping stream {channel}...")
 
     def stop_all_streams(self):
         for stream in list(self.stream_workers.values()):
+            stream["stopping"] = True
             stream["worker"].stop()
 
         for stream in list(self.stream_workers.values()):
             if not stream["thread"].wait(5000):
                 logging.warning("Timed out waiting for stream worker to stop")
 
-        self.stream_workers.clear()
-        for channel in list(self.preview_labels):
-            self.remove_preview(channel)
+        for channel in list(self.preview_windows):
+            self.remove_preview_window(channel)
 
     def finish_stream(self, channel):
-        self.stream_workers.pop(channel, None)
         self.uncheck_channel(channel)
-        self.remove_preview(channel)
+        self.remove_preview_window(channel)
         self.scan_status.setText(f"Stopped stream {channel}.")
+
+    def cleanup_stream_thread(self, channel):
+        self.stream_workers.pop(channel, None)
 
     def uncheck_channel(self, channel):
         for index in range(self.camera_list.count()):
@@ -391,51 +445,25 @@ class CameraSettingsDialog(QDialog):
     def show_stream_error(self, channel, error):
         QMessageBox.critical(self, "Stream Error", f"Stream {channel} stopped:\n{error}")
 
-    def add_preview(self, channel, label):
-        preview = QLabel(f"Starting {label}...")
-        preview.setAlignment(Qt.AlignCenter)
-        preview.setMinimumSize(260, 150)
-        preview.setStyleSheet("border: 1px solid #bac4ce; background: #111827; color: white;")
-        self.preview_labels[channel] = preview
-        self.relayout_previews()
+    def add_preview_window(self, channel, label):
+        preview_window = StreamPreviewWindow(channel, label)
+        preview_window.close_requested.connect(self.stop_stream)
+        self.preview_windows[channel] = preview_window
+        preview_window.show()
 
     def update_preview(self, channel, frame_bytes):
-        preview = self.preview_labels.get(channel)
-        if preview is None:
+        preview_window = self.preview_windows.get(channel)
+        if preview_window is not None:
+            preview_window.update_frame(frame_bytes)
+
+    def remove_preview_window(self, channel):
+        preview_window = self.preview_windows.pop(channel, None)
+        if preview_window is None:
             return
 
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(frame_bytes, "JPG"):
-            return
-
-        preview.setPixmap(
-            pixmap.scaled(
-                preview.width(),
-                max(preview.height(), 1),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-        )
-
-    def remove_preview(self, channel):
-        preview = self.preview_labels.pop(channel, None)
-        if preview is None:
-            return
-
-        self.preview_layout.removeWidget(preview)
-        preview.deleteLater()
-        self.relayout_previews()
-
-    def relayout_previews(self):
-        for index, preview in enumerate(self.preview_labels.values()):
-            row = index // PREVIEW_COLUMNS
-            column = index % PREVIEW_COLUMNS
-            self.preview_layout.addWidget(preview, row, column)
-
-
-def get_camera_settings():
-    dialog = CameraSettingsDialog()
-    dialog.exec()
+        preview_window.close_requested.disconnect(self.stop_stream)
+        preview_window.close()
+        preview_window.deleteLater()
 
 
 def iter_common_hikvision_channels():
@@ -469,6 +497,25 @@ def build_rtsp_url(settings, channel=None):
     return f"rtsp://{username}:{password}@{ip_address}:{port}/Streaming/Channels/{channel}"
 
 
+def open_rtsp_capture(rtsp_url):
+    cap = cv2.VideoCapture()
+
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, STREAM_OPEN_TIMEOUT_MS)
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, STREAM_READ_TIMEOUT_MS)
+
+    if cap.open(rtsp_url, cv2.CAP_FFMPEG):
+        return cap
+
+    cap.release()
+    return None
+
+
+def wait_before_reconnect(stop_requested):
+    end_time = time.monotonic() + STREAM_RECONNECT_DELAY_SECONDS
+    while not stop_requested() and time.monotonic() < end_time:
+        time.sleep(0.1)
+
+
 def create_video_writer(clip_path, fps, size):
     for codec in ("avc1", "H264", "mp4v"):
         fourcc = cv2.VideoWriter_fourcc(*codec)
@@ -483,39 +530,56 @@ def create_video_writer(clip_path, fps, size):
     raise RuntimeError("Could not create video writer")
 
 
-def run_detection(rtsp_url, window_title, stop_requested, frame_callback):
-    model = YOLO(resource_path("yolov8n.pt"))
+def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_callback):
+    model = YOLO(resource_path(YOLO_MODEL_FILENAME))
     motion_detector = cv2.createBackgroundSubtractorMOG2(
         history=500,
         varThreshold=50,
         detectShadows=True,
     )
 
-    cap = cv2.VideoCapture()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, STREAM_OPEN_TIMEOUT_MS)
-    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, STREAM_READ_TIMEOUT_MS)
-
-    if not cap.open(rtsp_url, cv2.CAP_FFMPEG):
-        raise RuntimeError("Could not open RTSP stream.")
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0:
-        fps = 20
-
+    cap = None
+    fps = 20
     writer = None
     frames_left_in_clip = 0
     frame_count = 0
+    consecutive_read_failures = 0
 
     try:
         while not stop_requested():
+            if cap is None:
+                cap = open_rtsp_capture(rtsp_url)
+                if cap is None:
+                    logging.warning("Could not open RTSP stream %s. Retrying...", window_title)
+                    wait_before_reconnect(stop_requested)
+                    continue
+
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if not fps or fps <= 0:
+                    fps = 20
+                consecutive_read_failures = 0
+                logging.info("Connected RTSP stream %s", window_title)
+
             ret, frame = cap.read()
 
             if not ret:
-                print("Could not read frame")
-                break
+                consecutive_read_failures += 1
+                if consecutive_read_failures < READ_FAILURES_BEFORE_RECONNECT:
+                    continue
+
+                logging.warning("Lost RTSP stream %s. Reconnecting...", window_title)
+                if writer is not None:
+                    writer.release()
+                    writer = None
+
+                cap.release()
+                cap = None
+                wait_before_reconnect(stop_requested)
+                continue
+
+            consecutive_read_failures = 0
 
             motion_mask = motion_detector.apply(frame)
             motion_mask = cv2.threshold(motion_mask, 244, 255, cv2.THRESH_BINARY)[1]
@@ -529,6 +593,7 @@ def run_detection(rtsp_url, window_title, stop_requested, frame_callback):
 
             motion_detected = False
             target_object_detected = False
+            matched_objects = set()
             annotated_frame = frame.copy()
 
             for contour in contours:
@@ -540,14 +605,15 @@ def run_detection(rtsp_url, window_title, stop_requested, frame_callback):
                 cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
 
             if motion_detected:
-                results = model(frame, verbose=False)
+                results = model(frame, verbose=False, conf=YOLO_CONFIDENCE)
 
                 annotated_frame = results[0].plot()
                 detected_objects = {
                     model.names[int(box.cls[0])]
                     for box in results[0].boxes
                 }
-                target_object_detected = bool(detected_objects & TARGET_OBJECTS)
+                matched_objects = detected_objects & target_objects
+                target_object_detected = bool(matched_objects)
 
             if writer is None and target_object_detected:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -555,11 +621,12 @@ def run_detection(rtsp_url, window_title, stop_requested, frame_callback):
                     character if character.isalnum() else "_"
                     for character in window_title
                 ).strip("_")
-                clip_path = OUTPUT_DIR / f"car_{safe_window_title}_{timestamp}.mp4"
+                object_label = "_".join(sorted(matched_objects))
+                clip_path = OUTPUT_DIR / f"{object_label}_{safe_window_title}_{timestamp}.mp4"
                 height, width = annotated_frame.shape[:2]
                 writer = create_video_writer(clip_path, fps, (width, height))
                 frames_left_in_clip = int(fps * CLIP_SECONDS)
-                print(f"Recording car clip: {clip_path}")
+                print(f"Recording {object_label} clip: {clip_path}")
 
             if writer is not None:
                 writer.write(annotated_frame)
@@ -579,15 +646,18 @@ def run_detection(rtsp_url, window_title, stop_requested, frame_callback):
         if writer is not None:
             writer.release()
 
-        cap.release()
+        if cap is not None:
+            cap.release()
 
 
 def main():
     logging.info("Starting security camera app")
     app = QApplication(sys.argv)
-    get_camera_settings()
-    app.quit()
+    window = CameraSettingsDialog()
+    window.show()
+    exit_code = app.exec()
     logging.info("Security camera app stopped")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
