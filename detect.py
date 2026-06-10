@@ -35,6 +35,7 @@ OUTPUT_DIR = Path.home() / "SecurityCamera" / "clips"
 DEFAULT_TARGET_OBJECTS = {"car"}
 AVAILABLE_TARGET_OBJECTS = ("car", "person")
 DEFAULT_RTSP_PORT = "554"
+DEFAULT_RTSP_PATH_TEMPLATE = "/Streaming/Channels/{channel}"
 CHANNEL_SCAN_LIMIT = 16
 STREAM_OPEN_TIMEOUT_MS = 1200
 STREAM_READ_TIMEOUT_MS = 1200
@@ -189,6 +190,8 @@ class CameraSettingsDialog(QDialog):
         self.password_input.setEchoMode(QLineEdit.Password)
         self.ip_input = QLineEdit()
         self.port_input = QLineEdit(DEFAULT_RTSP_PORT)
+        self.rtsp_path_template_input = QLineEdit(DEFAULT_RTSP_PATH_TEMPLATE)
+        self.rtsp_path_template_input.setPlaceholderText("/Streaming/Channels/{channel}")
         self.manual_channel_input = QLineEdit()
         self.object_checkboxes = {}
 
@@ -211,6 +214,7 @@ class CameraSettingsDialog(QDialog):
         form.addRow("Password", self.password_input)
         form.addRow("DVR/NVR IP", self.ip_input)
         form.addRow("RTSP Port", self.port_input)
+        form.addRow("RTSP Path Template", self.rtsp_path_template_input)
         form.addRow("Manual Channel", self.manual_channel_input)
         for object_name, checkbox in self.object_checkboxes.items():
             form.addRow("Record Objects", checkbox)
@@ -250,6 +254,7 @@ class CameraSettingsDialog(QDialog):
             "password": self.password_input.text(),
             "ip_address": self.ip_input.text().strip(),
             "port": self.port_input.text().strip(),
+            "rtsp_path_template": self.rtsp_path_template_input.text().strip(),
         }
 
     def selected_target_objects(self):
@@ -275,13 +280,13 @@ class CameraSettingsDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Missing Details",
-                "Enter username, password, DVR/NVR IP, and RTSP port before scanning.",
+                "Enter username, password, DVR/NVR IP, RTSP port, and RTSP path template before scanning.",
             )
             return
 
         self.stop_all_streams()
         self.camera_list.clear()
-        self.scan_status.setText("Scanning common Hikvision channels...")
+        self.scan_status.setText("Scanning common camera/stream channels...")
         self.scan_button.setEnabled(False)
         self.scan_button.setText("Scanning...")
 
@@ -334,7 +339,7 @@ class CameraSettingsDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Missing Details",
-                "Enter username, password, DVR/NVR IP, RTSP port, and manual channel.",
+                "Enter username, password, DVR/NVR IP, RTSP port, RTSP path template, and manual channel.",
             )
             return
 
@@ -361,7 +366,7 @@ class CameraSettingsDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Missing Details",
-                "Enter username, password, DVR/NVR IP, and RTSP port before starting a stream.",
+                "Enter username, password, DVR/NVR IP, RTSP port, and RTSP path template before starting a stream.",
             )
             self.camera_list.blockSignals(True)
             item.setCheckState(Qt.Unchecked)
@@ -379,7 +384,15 @@ class CameraSettingsDialog(QDialog):
             self.camera_list.blockSignals(False)
             return
 
-        rtsp_url = build_rtsp_url(settings, channel=channel)
+        try:
+            rtsp_url = build_rtsp_url(settings, channel=channel)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid RTSP Template", str(exc))
+            self.camera_list.blockSignals(True)
+            item.setCheckState(Qt.Unchecked)
+            self.camera_list.blockSignals(False)
+            return
+
         thread = QThread(self)
         worker = CameraDetectionWorker(channel, rtsp_url, label, target_objects)
         worker.moveToThread(thread)
@@ -493,8 +506,39 @@ def build_rtsp_url(settings, channel=None):
     password = quote(settings["password"], safe="")
     ip_address = settings["ip_address"]
     port = settings["port"]
+    camera, stream = channel_parts(channel)
+    template = settings["rtsp_path_template"]
+    template_values = {
+        "username": username,
+        "password": password,
+        "ip": ip_address,
+        "ip_address": ip_address,
+        "port": port,
+        "channel": channel or "",
+        "camera": camera,
+        "stream": stream,
+    }
 
-    return f"rtsp://{username}:{password}@{ip_address}:{port}/Streaming/Channels/{channel}"
+    try:
+        rendered_template = template.format(**template_values)
+    except KeyError as exc:
+        raise ValueError(f"Unknown RTSP template field: {exc}") from exc
+
+    if rendered_template.startswith("rtsp://"):
+        return rendered_template
+
+    if not rendered_template.startswith("/"):
+        rendered_template = f"/{rendered_template}"
+
+    return f"rtsp://{username}:{password}@{ip_address}:{port}{rendered_template}"
+
+
+def channel_parts(channel):
+    channel_text = str(channel or "").strip()
+    if channel_text.isdigit() and len(channel_text) >= 3:
+        return channel_text[:-2], channel_text[-1]
+
+    return channel_text, channel_text
 
 
 def open_rtsp_capture(rtsp_url):
