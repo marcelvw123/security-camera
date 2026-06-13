@@ -7,12 +7,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 import cv2
+from cloud_upload import upload_clip_async
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QCheckBox,
     QLabel,
@@ -26,14 +28,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from ultralytics import YOLO
+from scenario_detector import ScenarioDetector, scenario_relevant_objects
+from video_compat import make_whatsapp_compatible_mp4
 
 MIN_MOTION_AREA = 1000
-CLIP_SECONDS = 10
+CLIP_SECONDS = 20
 YOLO_MODEL_FILENAME = "yolo11s.pt"
 YOLO_CONFIDENCE = 0.55
 OUTPUT_DIR = Path.home() / "SecurityCamera" / "clips"
 DEFAULT_TARGET_OBJECTS = {"car"}
-AVAILABLE_TARGET_OBJECTS = ("car", "person")
+AVAILABLE_TARGET_OBJECTS = ("car", "person", "truck", "bus", "motorcycle")
 DEFAULT_RTSP_PORT = "554"
 DEFAULT_RTSP_PATH_TEMPLATE = "/Streaming/Channels/{channel}"
 CHANNEL_SCAN_LIMIT = 16
@@ -135,6 +139,43 @@ class CameraDetectionWorker(QObject):
         self.frame_ready.emit(self.channel, frame_bytes)
 
 
+class VideoClipDetectionWorker(QObject):
+    error = Signal(str, str)
+    finished = Signal(str)
+    frame_ready = Signal(str, bytes)
+
+    def __init__(self, source_id, video_path, window_title, target_objects):
+        super().__init__()
+        self.source_id = source_id
+        self.video_path = video_path
+        self.window_title = window_title
+        self.target_objects = target_objects
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        try:
+            run_video_clip_detection(
+                self.video_path,
+                self.target_objects,
+                self.should_stop,
+                self.emit_frame,
+            )
+        except Exception as exc:
+            logging.exception("Video clip %s failed", self.video_path)
+            self.error.emit(self.source_id, str(exc))
+        finally:
+            self.finished.emit(self.source_id)
+
+    def should_stop(self):
+        return self._stopped
+
+    def emit_frame(self, frame_bytes):
+        self.frame_ready.emit(self.source_id, frame_bytes)
+
+
 class StreamPreviewWindow(QWidget):
     close_requested = Signal(str)
 
@@ -193,6 +234,8 @@ class CameraSettingsDialog(QDialog):
         self.rtsp_path_template_input = QLineEdit(DEFAULT_RTSP_PATH_TEMPLATE)
         self.rtsp_path_template_input.setPlaceholderText("/Streaming/Channels/{channel}")
         self.manual_channel_input = QLineEdit()
+        self.video_clip_input = QLineEdit()
+        self.video_clip_input.setPlaceholderText("/path/to/test-video.mp4")
         self.object_checkboxes = {}
 
         for object_name in AVAILABLE_TARGET_OBJECTS:
@@ -208,6 +251,10 @@ class CameraSettingsDialog(QDialog):
         self.scan_button.clicked.connect(self.scan_cameras)
         self.add_manual_button = QPushButton("Add Manual Channel")
         self.add_manual_button.clicked.connect(self.add_manual_channel)
+        self.browse_video_button = QPushButton("Browse Video Clip")
+        self.browse_video_button.clicked.connect(self.browse_video_clip)
+        self.test_video_button = QPushButton("Annotate Video Clip")
+        self.test_video_button.clicked.connect(self.test_video_clip)
 
         form = QFormLayout()
         form.addRow("Username", self.username_input)
@@ -216,10 +263,13 @@ class CameraSettingsDialog(QDialog):
         form.addRow("RTSP Port", self.port_input)
         form.addRow("RTSP Path Template", self.rtsp_path_template_input)
         form.addRow("Manual Channel", self.manual_channel_input)
+        form.addRow("Video Clip", self.video_clip_input)
         for object_name, checkbox in self.object_checkboxes.items():
             form.addRow("Record Objects", checkbox)
         form.addRow("", self.scan_button)
         form.addRow("", self.add_manual_button)
+        form.addRow("", self.browse_video_button)
+        form.addRow("", self.test_video_button)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
@@ -347,6 +397,61 @@ class CameraSettingsDialog(QDialog):
         self.add_camera_item(label, channel)
         self.manual_channel_input.clear()
         self.scan_status.setText("Manual channel added. Tick it to start the stream.")
+
+    def browse_video_clip(self):
+        video_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose Video Clip",
+            str(Path.home()),
+            "Video Files (*.mp4 *.mov *.avi *.mkv *.m4v);;All Files (*)",
+        )
+        if video_path:
+            self.video_clip_input.setText(video_path)
+
+    def test_video_clip(self):
+        video_path_text = self.video_clip_input.text().strip()
+        target_objects = self.selected_target_objects()
+
+        if not video_path_text:
+            QMessageBox.warning(self, "Missing Video", "Choose a video clip to test.")
+            return
+
+        video_path = Path(video_path_text).expanduser()
+        if not video_path.is_file():
+            QMessageBox.warning(self, "Missing Video", f"Video clip does not exist:\n{video_path}")
+            return
+
+        if not target_objects:
+            QMessageBox.warning(self, "Missing Objects", "Select at least one object to detect.")
+            return
+
+        source_id = f"clip:{video_path}"
+        if source_id in self.stream_workers:
+            self.scan_status.setText(f"Video clip is already running: {video_path.name}")
+            return
+
+        label = f"Video Clip: {video_path.name}"
+        thread = QThread(self)
+        worker = VideoClipDetectionWorker(source_id, str(video_path), label, target_objects)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.frame_ready.connect(self.update_preview)
+        worker.error.connect(self.show_stream_error)
+        worker.finished.connect(self.finish_stream)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda channel=source_id: self.cleanup_stream_thread(channel))
+        thread.finished.connect(thread.deleteLater)
+
+        self.stream_workers[source_id] = {
+            "thread": thread,
+            "worker": worker,
+            "stopping": False,
+        }
+        self.add_preview_window(source_id, label)
+        self.scan_status.setText(f"Testing video clip: {video_path.name}")
+        thread.start()
 
     def toggle_stream(self, item):
         channel = str(item.data(Qt.UserRole)).strip()
@@ -574,8 +679,213 @@ def create_video_writer(clip_path, fps, size):
     raise RuntimeError("Could not create video writer")
 
 
+def upload_saved_clip(clip_path, source_name, detected_objects, clip_type, scenario_name):
+    compatible_clip_path = make_whatsapp_compatible_mp4(clip_path)
+    metadata = {
+        "camera": source_name,
+        "detected": sorted(detected_objects),
+        "source_name": source_name,
+        "detected_objects": sorted(detected_objects),
+        "clip_type": clip_type,
+        "scenario": scenario_name,
+    }
+    upload_clip_async(str(compatible_clip_path), metadata)
+
+
+def upload_non_scenario_clip(clip_path, source_name, detected_objects, clip_type, reason):
+    if clip_path is None:
+        return
+
+    logging.info("Uploading non-scenario clip %s: %s", clip_path, reason)
+    upload_saved_clip(
+        clip_path,
+        source_name,
+        detected_objects,
+        clip_type,
+        "no_scenario_detected",
+    )
+
+
+def target_class_ids(model, target_objects):
+    names = model.names.items() if hasattr(model.names, "items") else enumerate(model.names)
+    return [
+        class_id
+        for class_id, class_name in names
+        if class_name in target_objects
+    ]
+
+
+def emit_preview_frame(frame, frame_callback):
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_PREVIEW_QUALITY]
+    encoded, buffer = cv2.imencode(".jpg", frame, encode_params)
+    if encoded:
+        frame_callback(buffer.tobytes())
+
+
+def detect_motion(frame, motion_detector):
+    motion_mask = motion_detector.apply(frame)
+    motion_mask = cv2.threshold(motion_mask, 244, 255, cv2.THRESH_BINARY)[1]
+    motion_mask = cv2.dilate(motion_mask, None, iterations=2)
+
+    contours, _ = cv2.findContours(
+        motion_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    motion_boxes = []
+    for contour in contours:
+        if cv2.contourArea(contour) < MIN_MOTION_AREA:
+            continue
+
+        motion_boxes.append(cv2.boundingRect(contour))
+
+    return motion_boxes
+
+
+def draw_motion_boxes(frame, motion_boxes):
+    for x, y, width, height in motion_boxes:
+        cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 255), 2)
+
+
+def draw_detection_status(frame, motion_detected, matched_objects):
+    status_lines = [
+        f"Motion: {'YES' if motion_detected else 'NO'}",
+        f"Objects: {', '.join(sorted(matched_objects)) if matched_objects else 'none'}",
+    ]
+    for index, text in enumerate(status_lines):
+        y = 30 + (index * 28)
+        cv2.putText(frame, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
+        cv2.putText(frame, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+
+def run_video_clip_detection(video_path, target_objects, stop_requested, frame_callback):
+    model = YOLO(resource_path(YOLO_MODEL_FILENAME))
+    class_ids = target_class_ids(model, target_objects)
+    scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
+    motion_detector = cv2.createBackgroundSubtractorMOG2(
+        history=500,
+        varThreshold=50,
+        detectShadows=True,
+    )
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video clip: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 20
+    frame_delay = min(1 / fps, 0.1)
+    writer = None
+    clip_path = None
+    clip_objects = set()
+    scenario_match = None
+    frames_left_in_clip = 0
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        while not stop_requested():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            motion_boxes = detect_motion(frame, motion_detector)
+            motion_detected = bool(motion_boxes)
+            results = model(frame, verbose=False, conf=YOLO_CONFIDENCE, classes=class_ids)
+            matched_objects = {
+                model.names[int(box.cls[0])]
+                for box in results[0].boxes
+            } & target_objects
+            detected_objects = {
+                model.names[int(box.cls[0])]
+                for box in results[0].boxes
+            }
+            relevant_objects = scenario_relevant_objects(detected_objects)
+            current_scenario_match = scenario_detector.record_detection(Path(video_path).name, detected_objects)
+            annotated_frame = results[0].plot()
+            draw_motion_boxes(annotated_frame, motion_boxes)
+            draw_detection_status(annotated_frame, motion_detected, matched_objects)
+
+            if writer is None and relevant_objects:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_video_name = "".join(
+                    character if character.isalnum() else "_"
+                    for character in Path(video_path).stem
+                ).strip("_")
+                clip_path = OUTPUT_DIR / f"pending_scenario_{safe_video_name}_{timestamp}.mp4"
+                height, width = annotated_frame.shape[:2]
+                writer = create_video_writer(clip_path, fps, (width, height))
+                clip_objects = set(relevant_objects)
+                frames_left_in_clip = int(fps * CLIP_SECONDS)
+                logging.info("Started pending scenario video clip: %s", clip_path)
+                print(f"Started pending scenario clip: {clip_path}")
+
+            if writer is not None:
+                clip_objects.update(relevant_objects)
+
+            if scenario_match is None and current_scenario_match is not None:
+                scenario_match = current_scenario_match
+                logging.info("Scenario matched for pending video clip: %s", clip_path)
+                print(f"Scenario matched for pending clip: {clip_path}")
+
+            if writer is not None:
+                writer.write(annotated_frame)
+                frames_left_in_clip -= 1
+
+                if frames_left_in_clip <= 0:
+                    writer.release()
+                    if clip_path is not None and scenario_match is not None:
+                        upload_saved_clip(
+                            clip_path,
+                            Path(video_path).name,
+                            scenario_match.objects,
+                            "scenario_video_test",
+                            scenario_match.name,
+                        )
+                    elif clip_path is not None:
+                        upload_non_scenario_clip(
+                            clip_path,
+                            Path(video_path).name,
+                            clip_objects,
+                            "video_test",
+                            "20 second clip ended without scenario match",
+                        )
+
+                    writer = None
+                    clip_path = None
+                    clip_objects = set()
+                    scenario_match = None
+                    frames_left_in_clip = 0
+                    scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
+            emit_preview_frame(annotated_frame, frame_callback)
+            time.sleep(frame_delay)
+    finally:
+        if writer is not None:
+            writer.release()
+            if clip_path is not None and scenario_match is not None:
+                upload_saved_clip(
+                    clip_path,
+                    Path(video_path).name,
+                    scenario_match.objects,
+                    "scenario_video_test",
+                    scenario_match.name,
+                )
+            elif clip_path is not None:
+                upload_non_scenario_clip(
+                    clip_path,
+                    Path(video_path).name,
+                    clip_objects,
+                    "video_test",
+                    "video ended before scenario matched",
+                )
+
+        cap.release()
+
+
 def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_callback):
     model = YOLO(resource_path(YOLO_MODEL_FILENAME))
+    scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
     motion_detector = cv2.createBackgroundSubtractorMOG2(
         history=500,
         varThreshold=50,
@@ -587,6 +897,9 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
     cap = None
     fps = 20
     writer = None
+    active_clip_path = None
+    active_clip_objects = set()
+    active_clip_scenario = None
     frames_left_in_clip = 0
     frame_count = 0
     consecutive_read_failures = 0
@@ -616,7 +929,28 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                 logging.warning("Lost RTSP stream %s. Reconnecting...", window_title)
                 if writer is not None:
                     writer.release()
+                    if active_clip_path is not None and active_clip_scenario is not None:
+                        upload_saved_clip(
+                            active_clip_path,
+                            window_title,
+                            active_clip_objects,
+                            "scenario_camera_detection",
+                            active_clip_scenario,
+                        )
+                    elif active_clip_path is not None:
+                        upload_non_scenario_clip(
+                            active_clip_path,
+                            window_title,
+                            active_clip_objects,
+                            "camera_detection",
+                            "stream lost before scenario matched",
+                        )
                     writer = None
+                    active_clip_path = None
+                    active_clip_objects = set()
+                    active_clip_scenario = None
+                    frames_left_in_clip = 0
+                    scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
 
                 cap.release()
                 cap = None
@@ -625,52 +959,53 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
 
             consecutive_read_failures = 0
 
-            motion_mask = motion_detector.apply(frame)
-            motion_mask = cv2.threshold(motion_mask, 244, 255, cv2.THRESH_BINARY)[1]
-            motion_mask = cv2.dilate(motion_mask, None, iterations=2)
-
-            contours, _ = cv2.findContours(
-                motion_mask,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE,
-            )
-
-            motion_detected = False
-            target_object_detected = False
+            motion_boxes = detect_motion(frame, motion_detector)
+            motion_detected = bool(motion_boxes)
             matched_objects = set()
+            detected_objects = set()
+            relevant_objects = set()
+            scenario_match = None
             annotated_frame = frame.copy()
-
-            for contour in contours:
-                if cv2.contourArea(contour) < MIN_MOTION_AREA:
-                    continue
-
-                motion_detected = True
-                x, y, w, h = cv2.boundingRect(contour)
-                cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            draw_motion_boxes(annotated_frame, motion_boxes)
 
             if motion_detected:
                 results = model(frame, verbose=False, conf=YOLO_CONFIDENCE)
 
                 annotated_frame = results[0].plot()
+                draw_motion_boxes(annotated_frame, motion_boxes)
                 detected_objects = {
                     model.names[int(box.cls[0])]
                     for box in results[0].boxes
                 }
                 matched_objects = detected_objects & target_objects
-                target_object_detected = bool(matched_objects)
+                relevant_objects = scenario_relevant_objects(detected_objects)
+                scenario_match = scenario_detector.record_detection(window_title, detected_objects)
 
-            if writer is None and target_object_detected:
+            draw_detection_status(annotated_frame, motion_detected, matched_objects)
+
+            if writer is None and relevant_objects:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 safe_window_title = "".join(
                     character if character.isalnum() else "_"
                     for character in window_title
                 ).strip("_")
-                object_label = "_".join(sorted(matched_objects))
-                clip_path = OUTPUT_DIR / f"{object_label}_{safe_window_title}_{timestamp}.mp4"
+                clip_path = OUTPUT_DIR / f"pending_scenario_{safe_window_title}_{timestamp}.mp4"
                 height, width = annotated_frame.shape[:2]
                 writer = create_video_writer(clip_path, fps, (width, height))
+                active_clip_path = clip_path
+                active_clip_objects = set(relevant_objects)
                 frames_left_in_clip = int(fps * CLIP_SECONDS)
-                print(f"Recording {object_label} clip: {clip_path}")
+                logging.info("Started pending scenario clip for %s: %s", window_title, clip_path)
+                print(f"Started pending scenario clip: {clip_path}")
+
+            if writer is not None:
+                active_clip_objects.update(relevant_objects)
+
+            if active_clip_scenario is None and scenario_match is not None:
+                active_clip_objects = set(scenario_match.objects)
+                active_clip_scenario = scenario_match.name
+                logging.info("Scenario matched for pending clip %s: %s", window_title, active_clip_path)
+                print(f"Scenario matched for pending clip: {active_clip_path}")
 
             if writer is not None:
                 writer.write(annotated_frame)
@@ -678,17 +1013,51 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
 
                 if frames_left_in_clip <= 0:
                     writer.release()
+                    if active_clip_path is not None and active_clip_scenario is not None:
+                        upload_saved_clip(
+                            active_clip_path,
+                            window_title,
+                            active_clip_objects,
+                            "scenario_camera_detection",
+                            active_clip_scenario,
+                        )
+                    elif active_clip_path is not None:
+                        upload_non_scenario_clip(
+                            active_clip_path,
+                            window_title,
+                            active_clip_objects,
+                            "camera_detection",
+                            "20 second clip ended without scenario match",
+                        )
                     writer = None
+                    active_clip_path = None
+                    active_clip_objects = set()
+                    active_clip_scenario = None
+                    frames_left_in_clip = 0
+                    scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
 
             frame_count += 1
             if frame_count % PREVIEW_EVERY_N_FRAMES == 0:
-                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_PREVIEW_QUALITY]
-                encoded, buffer = cv2.imencode(".jpg", annotated_frame, encode_params)
-                if encoded:
-                    frame_callback(buffer.tobytes())
+                emit_preview_frame(annotated_frame, frame_callback)
     finally:
         if writer is not None:
             writer.release()
+            if active_clip_path is not None and active_clip_scenario is not None:
+                upload_saved_clip(
+                    active_clip_path,
+                    window_title,
+                    active_clip_objects,
+                    "scenario_camera_detection",
+                    active_clip_scenario,
+                )
+            elif active_clip_path is not None:
+                upload_non_scenario_clip(
+                    active_clip_path,
+                    window_title,
+                    active_clip_objects,
+                    "camera_detection",
+                    "stream stopped before scenario matched",
+                )
 
         if cap is not None:
             cap.release()
