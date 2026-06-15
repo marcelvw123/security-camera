@@ -36,7 +36,7 @@ CLIP_SECONDS = 20
 YOLO_MODEL_FILENAME = "yolo11s.pt"
 YOLO_CONFIDENCE = 0.55
 OUTPUT_DIR = Path.home() / "SecurityCamera" / "clips"
-DEFAULT_TARGET_OBJECTS = {"car"}
+DEFAULT_TARGET_OBJECTS = {"person"}
 AVAILABLE_TARGET_OBJECTS = ("car", "person", "truck", "bus", "motorcycle")
 DEFAULT_RTSP_PORT = "554"
 DEFAULT_RTSP_PATH_TEMPLATE = "/Streaming/Channels/{channel}"
@@ -793,16 +793,14 @@ def run_video_clip_detection(video_path, target_objects, stop_requested, frame_c
             motion_boxes = detect_motion(frame, motion_detector)
             motion_detected = bool(motion_boxes)
             results = model(frame, verbose=False, conf=YOLO_CONFIDENCE, classes=class_ids)
-            matched_objects = {
+            detected_object_names = [
                 model.names[int(box.cls[0])]
                 for box in results[0].boxes
-            } & target_objects
-            detected_objects = {
-                model.names[int(box.cls[0])]
-                for box in results[0].boxes
-            }
-            relevant_objects = scenario_relevant_objects(detected_objects)
-            current_scenario_match = scenario_detector.record_detection(Path(video_path).name, detected_objects)
+            ]
+            detected_objects = set(detected_object_names)
+            matched_objects = detected_objects & target_objects
+            relevant_objects = scenario_relevant_objects(detected_object_names)
+            current_scenario_match = scenario_detector.record_detection(Path(video_path).name, detected_object_names)
             annotated_frame = results[0].plot()
             draw_motion_boxes(annotated_frame, motion_boxes)
             draw_detection_status(annotated_frame, motion_detected, matched_objects)
@@ -973,13 +971,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
 
                 annotated_frame = results[0].plot()
                 draw_motion_boxes(annotated_frame, motion_boxes)
-                detected_objects = {
+                detected_object_names = [
                     model.names[int(box.cls[0])]
                     for box in results[0].boxes
-                }
+                ]
+                detected_objects = set(detected_object_names)
                 matched_objects = detected_objects & target_objects
-                relevant_objects = scenario_relevant_objects(detected_objects)
-                scenario_match = scenario_detector.record_detection(window_title, detected_objects)
+                relevant_objects = scenario_relevant_objects(detected_object_names)
+                scenario_match = scenario_detector.record_detection(window_title, detected_object_names)
 
             draw_detection_status(annotated_frame, motion_detected, matched_objects)
 
