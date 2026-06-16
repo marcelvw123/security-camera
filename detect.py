@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import cv2
+from camera_discovery import DiscoveredStream, discover_nvr_streams
 from cloud_upload import upload_clip_async
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
@@ -40,7 +41,6 @@ DEFAULT_TARGET_OBJECTS = {"person"}
 AVAILABLE_TARGET_OBJECTS = ("car", "person", "truck", "bus", "motorcycle")
 DEFAULT_RTSP_PORT = "554"
 DEFAULT_RTSP_PATH_TEMPLATE = "/Streaming/Channels/{channel}"
-CHANNEL_SCAN_LIMIT = 16
 STREAM_OPEN_TIMEOUT_MS = 1200
 STREAM_READ_TIMEOUT_MS = 1200
 STREAM_RECONNECT_DELAY_SECONDS = 2
@@ -73,7 +73,8 @@ def resource_path(filename):
 
 
 class CameraScanWorker(QObject):
-    camera_found = Signal(int, str, str)
+    camera_found = Signal(object)
+    progress = Signal(str)
     finished = Signal(int)
 
     def __init__(self, settings):
@@ -85,18 +86,24 @@ class CameraScanWorker(QObject):
         self._stopped = True
 
     def run(self):
-        found_count = 0
+        try:
+            streams = discover_nvr_streams(
+                self.settings,
+                can_open_rtsp_channel,
+                progress_callback=self.progress.emit,
+            )
+        except Exception:
+            logging.exception("NVR discovery failed")
+            self.progress.emit("Discovery failed unexpectedly. See log for details.")
+            streams = []
 
-        for camera_number, stream_name, channel in iter_common_hikvision_channels():
+        found_count = 0
+        for stream in streams:
             if self._stopped:
                 break
 
-            try:
-                if can_open_rtsp_channel(self.settings, channel):
-                    found_count += 1
-                    self.camera_found.emit(camera_number, stream_name, channel)
-            except Exception as exc:
-                logging.warning("Scan failed for channel %s: %s", channel, type(exc).__name__)
+            found_count += 1
+            self.camera_found.emit(stream)
 
         self.finished.emit(found_count)
 
@@ -233,6 +240,9 @@ class CameraSettingsDialog(QDialog):
         self.port_input = QLineEdit(DEFAULT_RTSP_PORT)
         self.rtsp_path_template_input = QLineEdit(DEFAULT_RTSP_PATH_TEMPLATE)
         self.rtsp_path_template_input.setPlaceholderText("/Streaming/Channels/{channel}")
+        self.rtsp_path_template_label = QLabel("RTSP Path Template")
+        self.rtsp_path_template_label.setVisible(False)
+        self.rtsp_path_template_input.setVisible(False)
         self.manual_channel_input = QLineEdit()
         self.video_clip_input = QLineEdit()
         self.video_clip_input.setPlaceholderText("/path/to/test-video.mp4")
@@ -246,8 +256,8 @@ class CameraSettingsDialog(QDialog):
         self.camera_list = QListWidget()
         self.camera_list.setMinimumHeight(180)
         self.camera_list.itemChanged.connect(self.toggle_stream)
-        self.scan_status = QLabel("Scan for cameras, then tick a stream to start it.")
-        self.scan_button = QPushButton("Scan Cameras")
+        self.scan_status = QLabel("Enter NVR details, then connect to discover streams.")
+        self.scan_button = QPushButton("Connect")
         self.scan_button.clicked.connect(self.scan_cameras)
         self.add_manual_button = QPushButton("Add Manual Channel")
         self.add_manual_button.clicked.connect(self.add_manual_channel)
@@ -261,7 +271,7 @@ class CameraSettingsDialog(QDialog):
         form.addRow("Password", self.password_input)
         form.addRow("DVR/NVR IP", self.ip_input)
         form.addRow("RTSP Port", self.port_input)
-        form.addRow("RTSP Path Template", self.rtsp_path_template_input)
+        form.addRow(self.rtsp_path_template_label, self.rtsp_path_template_input)
         form.addRow("Manual Channel", self.manual_channel_input)
         form.addRow("Video Clip", self.video_clip_input)
         for object_name, checkbox in self.object_checkboxes.items():
@@ -283,7 +293,7 @@ class CameraSettingsDialog(QDialog):
 
     def reject(self):
         if self.is_scanning():
-            QMessageBox.warning(self, "Scan Running", "Wait for the camera scan to finish.")
+            QMessageBox.warning(self, "Connection Running", "Wait for camera discovery to finish.")
             return
 
         self.stop_all_streams()
@@ -291,7 +301,7 @@ class CameraSettingsDialog(QDialog):
 
     def closeEvent(self, event):
         if self.is_scanning():
-            QMessageBox.warning(self, "Scan Running", "Wait for the camera scan to finish.")
+            QMessageBox.warning(self, "Connection Running", "Wait for camera discovery to finish.")
             event.ignore()
             return
 
@@ -330,21 +340,23 @@ class CameraSettingsDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Missing Details",
-                "Enter username, password, DVR/NVR IP, RTSP port, and RTSP path template before scanning.",
+                "Enter username, password, DVR/NVR IP, and RTSP port before connecting.",
             )
             return
 
         self.stop_all_streams()
         self.camera_list.clear()
-        self.scan_status.setText("Scanning common camera/stream channels...")
+        self.hide_rtsp_template_input()
+        self.scan_status.setText("Connecting: trying ONVIF discovery, then RTSP probing...")
         self.scan_button.setEnabled(False)
-        self.scan_button.setText("Scanning...")
+        self.scan_button.setText("Connecting...")
 
         self.scan_thread = QThread(self)
         self.scan_worker = CameraScanWorker(settings)
         self.scan_worker.moveToThread(self.scan_thread)
 
         self.scan_thread.started.connect(self.scan_worker.run)
+        self.scan_worker.progress.connect(self.update_scan_status)
         self.scan_worker.camera_found.connect(self.add_found_camera)
         self.scan_worker.finished.connect(self.finish_scan)
         self.scan_worker.finished.connect(self.scan_thread.quit)
@@ -353,26 +365,33 @@ class CameraSettingsDialog(QDialog):
         self.scan_thread.finished.connect(self.clear_scan_thread)
         self.scan_thread.start()
 
-    def add_found_camera(self, camera_number, stream_name, channel):
-        label = f"Camera {camera_number} {stream_name} ({channel})"
-        self.add_camera_item(label, channel)
+    def add_found_camera(self, stream):
+        self.add_camera_item(stream.label, stream)
+        if stream.rtsp_path_template:
+            self.rtsp_path_template_input.setText(stream.rtsp_path_template)
         self.scan_status.setText(f"Found {self.camera_list.count()} camera stream(s)...")
 
-    def add_camera_item(self, label, channel):
+    def update_scan_status(self, message):
+        self.scan_status.setText(message)
+
+    def add_camera_item(self, label, stream_data):
         item = QListWidgetItem(label)
-        item.setData(Qt.UserRole, channel)
+        item.setData(Qt.UserRole, stream_data)
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(Qt.Unchecked)
         self.camera_list.addItem(item)
 
     def finish_scan(self, found_count):
         self.scan_button.setEnabled(True)
-        self.scan_button.setText("Scan Cameras")
+        self.scan_button.setText("Connect")
 
         if found_count:
-            self.scan_status.setText(f"Scan complete. Tick a stream to start it. Found {found_count}.")
+            self.scan_status.setText(f"Connection complete. Tick a stream to start it. Found {found_count}.")
         else:
-            self.scan_status.setText("Scan complete. No streams found. You can add a channel manually.")
+            self.show_rtsp_template_input()
+            self.scan_status.setText(
+                "No streams found by ONVIF or RTSP probing. Enter an RTSP path template and add a channel manually."
+            )
 
     def clear_scan_thread(self):
         self.scan_thread = None
@@ -380,6 +399,14 @@ class CameraSettingsDialog(QDialog):
 
     def is_scanning(self):
         return self.scan_thread is not None and self.scan_thread.isRunning()
+
+    def show_rtsp_template_input(self):
+        self.rtsp_path_template_label.setVisible(True)
+        self.rtsp_path_template_input.setVisible(True)
+
+    def hide_rtsp_template_input(self):
+        self.rtsp_path_template_label.setVisible(False)
+        self.rtsp_path_template_input.setVisible(False)
 
     def add_manual_channel(self):
         settings = self.settings()
@@ -394,7 +421,16 @@ class CameraSettingsDialog(QDialog):
             return
 
         label = f"Manual Channel ({channel})"
-        self.add_camera_item(label, channel)
+        self.add_camera_item(
+            label,
+            DiscoveredStream(
+                label=label,
+                stream_id=f"manual:{channel}",
+                rtsp_path_template=settings["rtsp_path_template"],
+                channel=channel,
+                source="manual",
+            ),
+        )
         self.manual_channel_input.clear()
         self.scan_status.setText("Manual channel added. Tick it to start the stream.")
 
@@ -454,20 +490,26 @@ class CameraSettingsDialog(QDialog):
         thread.start()
 
     def toggle_stream(self, item):
-        channel = str(item.data(Qt.UserRole)).strip()
+        stream = item.data(Qt.UserRole)
+        stream_id = stream.stream_id if hasattr(stream, "stream_id") else str(stream).strip()
 
         if item.checkState() == Qt.Checked:
-            self.start_stream(channel, item.text(), item)
+            self.start_stream(stream, item.text(), item)
         else:
-            self.stop_stream(channel)
+            self.stop_stream(stream_id)
 
-    def start_stream(self, channel, label, item):
-        if channel in self.stream_workers:
+    def start_stream(self, stream, label, item):
+        stream_id = stream.stream_id if hasattr(stream, "stream_id") else str(stream).strip()
+        if stream_id in self.stream_workers:
             return
 
         settings = self.settings()
         target_objects = self.selected_target_objects()
-        if not all(settings.values()):
+        rtsp_url = getattr(stream, "rtsp_url", None)
+        rtsp_path_template = getattr(stream, "rtsp_path_template", None)
+        channel = getattr(stream, "channel", None)
+
+        if not rtsp_url and not all(settings.values()):
             QMessageBox.warning(
                 self,
                 "Missing Details",
@@ -490,7 +532,13 @@ class CameraSettingsDialog(QDialog):
             return
 
         try:
-            rtsp_url = build_rtsp_url(settings, channel=channel)
+            if rtsp_url:
+                stream_url = rtsp_url
+            else:
+                stream_settings = dict(settings)
+                if rtsp_path_template:
+                    stream_settings["rtsp_path_template"] = rtsp_path_template
+                stream_url = build_rtsp_url(stream_settings, channel=channel)
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid RTSP Template", str(exc))
             self.camera_list.blockSignals(True)
@@ -499,7 +547,7 @@ class CameraSettingsDialog(QDialog):
             return
 
         thread = QThread(self)
-        worker = CameraDetectionWorker(channel, rtsp_url, label, target_objects)
+        worker = CameraDetectionWorker(stream_id, stream_url, label, target_objects)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -508,16 +556,16 @@ class CameraSettingsDialog(QDialog):
         worker.finished.connect(self.finish_stream)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda channel=channel: self.cleanup_stream_thread(channel))
+        thread.finished.connect(lambda channel=stream_id: self.cleanup_stream_thread(channel))
         thread.finished.connect(thread.deleteLater)
 
-        self.stream_workers[channel] = {
+        self.stream_workers[stream_id] = {
             "thread": thread,
             "worker": worker,
             "stopping": False,
         }
-        self.add_preview_window(channel, label)
-        self.scan_status.setText(f"Started stream {channel}.")
+        self.add_preview_window(stream_id, label)
+        self.scan_status.setText(f"Started stream {label}.")
         thread.start()
 
     def stop_stream(self, channel):
@@ -552,7 +600,9 @@ class CameraSettingsDialog(QDialog):
     def uncheck_channel(self, channel):
         for index in range(self.camera_list.count()):
             item = self.camera_list.item(index)
-            if str(item.data(Qt.UserRole)).strip() != channel:
+            stream = item.data(Qt.UserRole)
+            stream_id = stream.stream_id if hasattr(stream, "stream_id") else str(stream).strip()
+            if stream_id != channel:
                 continue
 
             self.camera_list.blockSignals(True)
@@ -582,12 +632,6 @@ class CameraSettingsDialog(QDialog):
         preview_window.close_requested.disconnect(self.stop_stream)
         preview_window.close()
         preview_window.deleteLater()
-
-
-def iter_common_hikvision_channels():
-    for camera_number in range(1, CHANNEL_SCAN_LIMIT + 1):
-        yield camera_number, "Main Stream", f"{camera_number}01"
-        yield camera_number, "Sub Stream", f"{camera_number}02"
 
 
 def can_open_rtsp_channel(settings, channel):
