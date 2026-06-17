@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from itertools import count
 from datetime import datetime
 from pathlib import Path
@@ -20,10 +21,15 @@ from video_compat import make_whatsapp_compatible_mp4
 
 
 MIN_MOTION_AREA = 1000
+MAX_MOTION_AREA_RATIO = 0.60
+MAX_MOTION_BOX_ASPECT_RATIO = 8.0
+MIN_OBJECT_MOTION_OVERLAP_RATIO = 0.08
 CLIP_SECONDS = 20
 YOLO_MODEL_FILENAME = "yolo11s.pt"
 YOLO_CONFIDENCE = 0.55
 OUTPUT_DIR = Path.home() / "SecurityCamera" / "clips"
+DEBUG_FRAME_DIR = Path.home() / "SecurityCamera" / "debug_frames"
+SCENARIO_FRAME_DIR = Path.home() / "SecurityCamera" / "scenario_frames"
 DEFAULT_TARGET_OBJECTS = {"person"}
 AVAILABLE_TARGET_OBJECTS = ("car", "person", "truck", "bus", "motorcycle")
 DEFAULT_RTSP_PORT = "554"
@@ -35,6 +41,13 @@ READ_FAILURES_BEFORE_RECONNECT = 3
 PREVIEW_EVERY_N_FRAMES = 3
 JPEG_PREVIEW_QUALITY = 70
 _TRIGGER_COUNTER = count(1)
+
+
+@dataclass(frozen=True)
+class MotionSensitivityConfig:
+    level: int
+    min_motion_area: int
+    min_object_motion_overlap_ratio: float
 
 
 def resource_path(filename):
@@ -64,6 +77,17 @@ def log_trigger_step(trigger_id, step, message, *args):
         logging.info("%s %s %s", trigger_id, step, message)
     else:
         logging.info("%s %s", step, message)
+
+
+def motion_sensitivity_config(level=None):
+    level = int(level or 5)
+    level = max(1, min(level, 10))
+    threshold_multiplier = 5 / level
+    return MotionSensitivityConfig(
+        level=level,
+        min_motion_area=max(1, int(MIN_MOTION_AREA * threshold_multiplier)),
+        min_object_motion_overlap_ratio=min(1.0, MIN_OBJECT_MOTION_OVERLAP_RATIO * threshold_multiplier),
+    )
 
 
 def can_open_rtsp_channel(settings, channel):
@@ -229,7 +253,10 @@ def emit_preview_frame(frame, frame_callback):
         frame_callback(buffer.tobytes())
 
 
-def detect_motion(frame, motion_detector):
+def detect_motion(frame, motion_detector, sensitivity_config=None):
+    sensitivity_config = sensitivity_config or motion_sensitivity_config()
+    frame_height, frame_width = frame.shape[:2]
+    frame_area = frame_width * frame_height
     motion_mask = motion_detector.apply(frame)
     motion_mask = cv2.threshold(motion_mask, 244, 255, cv2.THRESH_BINARY)[1]
     motion_mask = cv2.dilate(motion_mask, None, iterations=2)
@@ -242,17 +269,69 @@ def detect_motion(frame, motion_detector):
 
     motion_boxes = []
     for contour in contours:
-        if cv2.contourArea(contour) < MIN_MOTION_AREA:
+        if cv2.contourArea(contour) < sensitivity_config.min_motion_area:
             continue
 
         motion_boxes.append(cv2.boundingRect(contour))
 
-    return motion_boxes
+    return [
+        motion_box
+        for motion_box in motion_boxes
+        if not is_motion_artifact(motion_box, frame_area)
+    ]
+
+
+def is_motion_artifact(motion_box, frame_area):
+    _x, _y, width, height = motion_box
+    if width <= 0 or height <= 0:
+        return True
+
+    box_area = width * height
+    if frame_area > 0 and box_area / frame_area > MAX_MOTION_AREA_RATIO:
+        return True
+
+    aspect_ratio = max(width / height, height / width)
+    return aspect_ratio > MAX_MOTION_BOX_ASPECT_RATIO
 
 
 def draw_motion_boxes(frame, motion_boxes):
     for x, y, width, height in motion_boxes:
         cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 255), 2)
+
+
+def boxes_overlap(box_a, box_b):
+    left_a, top_a, right_a, bottom_a = box_a
+    left_b, top_b, right_b, bottom_b = box_b
+    return left_a < right_b and right_a > left_b and top_a < bottom_b and bottom_a > top_b
+
+
+def overlap_area(box_a, box_b):
+    left_a, top_a, right_a, bottom_a = box_a
+    left_b, top_b, right_b, bottom_b = box_b
+    overlap_width = max(0, min(right_a, right_b) - max(left_a, left_b))
+    overlap_height = max(0, min(bottom_a, bottom_b) - max(top_a, top_b))
+    return overlap_width * overlap_height
+
+
+def motion_box_to_xyxy(motion_box):
+    x, y, width, height = motion_box
+    return x, y, x + width, y + height
+
+
+def detection_box_to_xyxy(box):
+    left, top, right, bottom = box.xyxy[0].tolist()
+    return int(left), int(top), int(right), int(bottom)
+
+
+def detection_overlaps_motion(box, motion_boxes, sensitivity_config=None):
+    sensitivity_config = sensitivity_config or motion_sensitivity_config()
+    detection_box = detection_box_to_xyxy(box)
+    detection_area = max(1, (detection_box[2] - detection_box[0]) * (detection_box[3] - detection_box[1]))
+    total_overlap_area = sum(
+        overlap_area(detection_box, motion_box_to_xyxy(motion_box))
+        for motion_box in motion_boxes
+    )
+    return total_overlap_area / detection_area >= sensitivity_config.min_object_motion_overlap_ratio
 
 
 def draw_detection_status(frame, motion_detected, matched_objects):
@@ -266,7 +345,41 @@ def draw_detection_status(frame, motion_detected, matched_objects):
         cv2.putText(frame, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
 
-def run_video_clip_detection(video_path, target_objects, stop_requested, frame_callback=noop_frame_callback):
+def save_trigger_debug_frame(frame, trigger_id, source_name, objects):
+    DEBUG_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_source_name = "".join(
+        character if character.isalnum() else "_"
+        for character in source_name
+    ).strip("_")
+    safe_objects = "_".join(sorted(objects)) or "objects"
+    debug_frame_path = DEBUG_FRAME_DIR / f"{trigger_id}_{safe_source_name}_{safe_objects}_{timestamp}.jpg"
+    if cv2.imwrite(str(debug_frame_path), frame):
+        log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVED", "image=%s", debug_frame_path)
+    else:
+        log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVE_FAILED", "image=%s", debug_frame_path)
+
+
+def save_scenario_frame(frame, trigger_id, source_name, scenario_name):
+    SCENARIO_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_source_name = "".join(
+        character if character.isalnum() else "_"
+        for character in source_name
+    ).strip("_")
+    safe_scenario_name = "".join(
+        character if character.isalnum() else "_"
+        for character in scenario_name
+    ).strip("_")
+    scenario_frame_path = SCENARIO_FRAME_DIR / f"{trigger_id}_{safe_source_name}_{safe_scenario_name}_{timestamp}.jpg"
+    if cv2.imwrite(str(scenario_frame_path), frame):
+        log_trigger_step(trigger_id, "STEP_5_SCENARIO_FRAME_SAVED", "image=%s", scenario_frame_path)
+    else:
+        log_trigger_step(trigger_id, "STEP_5_SCENARIO_FRAME_SAVE_FAILED", "image=%s", scenario_frame_path)
+
+
+def run_video_clip_detection(video_path, target_objects, stop_requested, frame_callback=noop_frame_callback, motion_sensitivity=None):
+    sensitivity_config = motion_sensitivity_config(motion_sensitivity)
     model = load_yolo_model()
     class_ids = target_class_ids(model, target_objects)
     scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
@@ -297,7 +410,7 @@ def run_video_clip_detection(video_path, target_objects, stop_requested, frame_c
             if not ret:
                 break
 
-            motion_boxes = detect_motion(frame, motion_detector)
+            motion_boxes = detect_motion(frame, motion_detector, sensitivity_config)
             motion_detected = bool(motion_boxes)
             results = model(frame, verbose=False, conf=YOLO_CONFIDENCE, classes=class_ids)
             detected_object_names = [
@@ -386,7 +499,8 @@ def run_video_clip_detection(video_path, target_objects, stop_requested, frame_c
         cap.release()
 
 
-def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_callback=noop_frame_callback):
+def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_callback=noop_frame_callback, motion_sensitivity=None):
+    sensitivity_config = motion_sensitivity_config(motion_sensitivity)
     model = load_yolo_model()
     scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
     motion_detector = cv2.createBackgroundSubtractorMOG2(
@@ -408,6 +522,13 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
     frames_left_in_clip = 0
     frame_count = 0
     consecutive_read_failures = 0
+    logging.info(
+        "Motion sensitivity for %s: level=%s min_motion_area=%s min_object_motion_overlap_ratio=%.3f",
+        window_title,
+        sensitivity_config.level,
+        sensitivity_config.min_motion_area,
+        sensitivity_config.min_object_motion_overlap_ratio,
+    )
 
     try:
         while not stop_requested():
@@ -469,10 +590,11 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
 
             consecutive_read_failures = 0
 
-            motion_boxes = detect_motion(frame, motion_detector)
+            motion_boxes = detect_motion(frame, motion_detector, sensitivity_config)
             motion_detected = bool(motion_boxes)
             matched_objects = set()
             relevant_objects = set()
+            moving_target_objects = set()
             scenario_match = None
             detected_object_names = []
             annotated_frame = frame.copy()
@@ -497,8 +619,15 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                     model.names[int(box.cls[0])]
                     for box in results[0].boxes
                 ]
+                moving_detected_object_names = [
+                    model.names[int(box.cls[0])]
+                    for box in results[0].boxes
+                    if detection_overlaps_motion(box, motion_boxes, sensitivity_config)
+                ]
                 detected_objects = set(detected_object_names)
+                moving_detected_objects = set(moving_detected_object_names)
                 matched_objects = detected_objects & target_objects
+                moving_target_objects = moving_detected_objects & target_objects
                 relevant_objects = scenario_relevant_objects(detected_object_names)
                 scenario_match = scenario_detector.record_detection(window_title, detected_object_names)
                 if writer is None and pending_trigger_id:
@@ -514,14 +643,20 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
 
             draw_detection_status(annotated_frame, motion_detected, matched_objects)
 
-            if writer is None and relevant_objects:
+            if writer is None and moving_target_objects:
                 if pending_trigger_id is None:
                     pending_trigger_id = new_trigger_id()
                 log_trigger_step(
                     pending_trigger_id,
-                    "STEP_3_RELEVANT_OBJECTS_DETECTED",
+                    "STEP_3_MOVING_TARGET_OBJECTS_DETECTED",
                     "objects=%s",
-                    sorted(relevant_objects),
+                    sorted(moving_target_objects),
+                )
+                save_trigger_debug_frame(
+                    annotated_frame,
+                    pending_trigger_id,
+                    window_title,
+                    moving_target_objects,
                 )
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 safe_window_title = "".join(
@@ -532,7 +667,7 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                 height, width = annotated_frame.shape[:2]
                 writer = create_video_writer(clip_path, fps, (width, height))
                 active_clip_path = clip_path
-                active_clip_objects = set(relevant_objects)
+                active_clip_objects = set(moving_target_objects)
                 active_trigger_id = pending_trigger_id
                 pending_trigger_id = None
                 frames_left_in_clip = int(fps * CLIP_SECONDS)
@@ -547,9 +682,10 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
             elif writer is None and pending_trigger_id and motion_detected:
                 log_trigger_step(
                     pending_trigger_id,
-                    "STEP_3_NO_RELEVANT_OBJECTS_DETECTED",
-                    "objects=%s",
+                    "STEP_3_NO_MOVING_TARGET_OBJECTS_DETECTED",
+                    "detected_objects=%s moving_target_objects=%s",
                     sorted(detected_object_names),
+                    sorted(moving_target_objects),
                 )
                 pending_trigger_id = None
 
@@ -565,6 +701,12 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                     "scenario=%s clip=%s",
                     active_clip_scenario,
                     active_clip_path,
+                )
+                save_scenario_frame(
+                    annotated_frame,
+                    active_trigger_id,
+                    window_title,
+                    active_clip_scenario,
                 )
 
             if writer is not None:

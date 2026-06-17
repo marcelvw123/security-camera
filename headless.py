@@ -1,13 +1,16 @@
 import getpass
+import json
 import logging
 import os
 import signal
 import sys
 import threading
 import time
+from pathlib import Path
 
 from app_config import load_dotenv
 from camera_discovery import discover_nvr_streams
+from network_guess import likely_dvr_ip
 from security_camera_core import (
     DEFAULT_RTSP_PATH_TEMPLATE,
     DEFAULT_RTSP_PORT,
@@ -19,6 +22,8 @@ from security_camera_core import (
 
 
 LOG_FILE = "security_camera_headless.log"
+DEFAULT_MOTION_SENSITIVITY = 5
+HEADLESS_STREAM_CONFIG_FILE = Path("headless_streams.json")
 
 
 def configure_logging():
@@ -42,9 +47,9 @@ def stream_url_for(settings, stream):
     return build_rtsp_url(stream_settings, channel=stream.channel)
 
 
-def run_stream(stream, settings, stop_event):
+def run_stream(stream, settings, stop_event, motion_sensitivity):
     rtsp_url = stream_url_for(settings, stream)
-    logging.info("Starting stream: %s", stream.label)
+    logging.info("Starting stream: %s with sensitivity %s", stream.label, motion_sensitivity)
     try:
         run_detection(
             rtsp_url,
@@ -52,6 +57,7 @@ def run_stream(stream, settings, stop_event):
             DEFAULT_TARGET_OBJECTS,
             stop_event.is_set,
             None,
+            motion_sensitivity,
         )
     except Exception:
         logging.exception("Stream failed: %s", stream.label)
@@ -102,7 +108,7 @@ def prompt_password(default=""):
 
 def build_settings():
     load_dotenv()
-    default_ip = env_value("CAMERA_IP", "NVR_IP")
+    default_ip = likely_dvr_ip() or ""
     default_username = env_value("CAMERA_USERNAME", "NVR_USERNAME")
     default_password = env_value("CAMERA_PASSWORD", "NVR_PASSWORD")
 
@@ -184,6 +190,105 @@ def select_streams(streams):
         print("Select at least one stream, or press Enter to run all.")
 
 
+def prompt_sensitivity(stream):
+    while True:
+        raw_value = input(f"Sensitivity for {stream.label} [{DEFAULT_MOTION_SENSITIVITY}]: ").strip()
+        if not raw_value:
+            return DEFAULT_MOTION_SENSITIVITY
+        if not raw_value.isdigit():
+            print("Enter a number from 1 to 10.")
+            continue
+
+        value = int(raw_value)
+        if 1 <= value <= 10:
+            return value
+
+        print("Enter a number from 1 to 10.")
+
+
+def parse_sensitivity_value(raw_value):
+    raw_value = str(raw_value).strip()
+    if not raw_value.isdigit():
+        raise ValueError("sensitivity must be a number from 1 to 10")
+
+    value = int(raw_value)
+    if 1 <= value <= 10:
+        return value
+
+    raise ValueError("sensitivity must be a number from 1 to 10")
+
+
+def prompt_stream_sensitivities(streams):
+    print("Set motion sensitivity per selected stream. 1 is least sensitive, 10 is most sensitive.")
+    return {
+        stream.stream_id: prompt_sensitivity(stream)
+        for stream in streams
+    }
+
+
+def load_headless_stream_config(all_streams):
+    if not HEADLESS_STREAM_CONFIG_FILE.is_file():
+        return None
+
+    try:
+        config = json.loads(HEADLESS_STREAM_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("Could not read %s: %s", HEADLESS_STREAM_CONFIG_FILE, exc)
+        return None
+
+    try:
+        configured_streams = config.get("streams", [])
+        if not configured_streams:
+            raise ValueError("streams list is empty")
+
+        streams_by_id = {stream.stream_id: stream for stream in all_streams}
+        selected_streams = []
+        stream_sensitivities = {}
+        missing_stream_ids = []
+
+        for configured_stream in configured_streams:
+            stream_id = str(configured_stream.get("stream_id", "")).strip()
+            if stream_id not in streams_by_id:
+                missing_stream_ids.append(stream_id or "<missing>")
+                continue
+
+            selected_streams.append(streams_by_id[stream_id])
+            stream_sensitivities[stream_id] = parse_sensitivity_value(
+                configured_stream.get("sensitivity", DEFAULT_MOTION_SENSITIVITY)
+            )
+
+        if missing_stream_ids:
+            raise ValueError(f"configured stream(s) not found: {', '.join(missing_stream_ids)}")
+
+        logging.info("Loaded headless stream config from %s", HEADLESS_STREAM_CONFIG_FILE)
+        return selected_streams, stream_sensitivities
+    except (AttributeError, TypeError, ValueError) as exc:
+        logging.warning("Invalid %s: %s", HEADLESS_STREAM_CONFIG_FILE, exc)
+        return None
+
+
+def save_headless_stream_config(streams, stream_sensitivities):
+    config = {
+        "streams": [
+            {
+                "stream_id": stream.stream_id,
+                "label": stream.label,
+                "sensitivity": stream_sensitivities[stream.stream_id],
+            }
+            for stream in streams
+        ]
+    }
+
+    try:
+        HEADLESS_STREAM_CONFIG_FILE.write_text(
+            json.dumps(config, indent=2),
+            encoding="utf-8",
+        )
+        logging.info("Saved headless stream config to %s", HEADLESS_STREAM_CONFIG_FILE)
+    except OSError as exc:
+        logging.warning("Could not save %s: %s", HEADLESS_STREAM_CONFIG_FILE, exc)
+
+
 def main():
     configure_logging()
 
@@ -199,7 +304,13 @@ def main():
         logging.error("No camera streams discovered.")
         return 1
 
-    streams = select_streams(streams)
+    configured_streams = load_headless_stream_config(streams)
+    if configured_streams is None:
+        streams = select_streams(streams)
+        stream_sensitivities = prompt_stream_sensitivities(streams)
+        save_headless_stream_config(streams, stream_sensitivities)
+    else:
+        streams, stream_sensitivities = configured_streams
 
     stop_event = threading.Event()
 
@@ -214,7 +325,7 @@ def main():
     for stream in streams:
         thread = threading.Thread(
             target=run_stream,
-            args=(stream, settings, stop_event),
+            args=(stream, settings, stop_event, stream_sensitivities[stream.stream_id]),
             daemon=False,
         )
         thread.start()

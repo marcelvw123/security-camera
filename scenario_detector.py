@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Callable, Dict, Iterable, List, Optional, Set
 
 
@@ -29,16 +29,28 @@ class ScenarioMatch:
 @dataclass(frozen=True)
 class ScenarioRule:
     name: str
-    predicate: Callable[[List[ScenarioEvent]], bool]
+    predicate: Callable[[List[ScenarioEvent], datetime], bool]
 
 
-def has_two_or_more_persons(events: List[ScenarioEvent]) -> bool:
+def has_two_or_more_persons(events: List[ScenarioEvent], _detected_at: datetime) -> bool:
     return any(person_count >= 2 for _event_time, _objects, person_count in events)
 
 
-def has_vehicle_and_person(events: List[ScenarioEvent]) -> bool:
+def has_vehicle_and_person(events: List[ScenarioEvent], _detected_at: datetime) -> bool:
     combined_objects = combined_event_objects(events)
     return bool(combined_objects & VEHICLE_OBJECTS) and bool(combined_objects & PERSON_OBJECTS)
+
+
+def has_person_after_hours(events: List[ScenarioEvent], detected_at: datetime) -> bool:
+    if not is_after_hours(detected_at):
+        return False
+
+    return any(person_count >= 1 for _event_time, _objects, person_count in events)
+
+
+def is_after_hours(detected_at: datetime) -> bool:
+    current_time = detected_at.time()
+    return current_time >= time(23, 0) or current_time < time(5, 0)
 
 
 def combined_event_objects(events: List[ScenarioEvent]) -> Set[str]:
@@ -49,6 +61,7 @@ def combined_event_objects(events: List[ScenarioEvent]) -> Set[str]:
 
 
 DEFAULT_SCENARIO_RULES = (
+    ScenarioRule("person_after_23h00", has_person_after_hours),
     ScenarioRule("two_or_more_persons", has_two_or_more_persons),
     ScenarioRule("vehicle_person", has_vehicle_and_person),
 )
@@ -85,7 +98,7 @@ class ScenarioDetector:
         events[:] = [event for event in events if event[0] >= window_start]
 
         for rule in self.rules:
-            if not rule.predicate(events):
+            if not rule.predicate(events, detected_at):
                 continue
 
             match_key = (camera_name, rule.name)

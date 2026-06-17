@@ -4,7 +4,8 @@ import traceback
 from pathlib import Path
 
 from camera_discovery import DiscoveredStream, discover_nvr_streams
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from network_guess import likely_dvr_ip
+from PySide6.QtCore import QObject, Qt, QThread, Signal, QSize
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QCheckBox,
     QLabel,
     QLineEdit,
@@ -20,8 +22,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
+    QAbstractScrollArea,
 )
 from security_camera_core import (
     AVAILABLE_TARGET_OBJECTS,
@@ -35,6 +39,7 @@ from security_camera_core import (
 )
 
 LOG_FILE = Path("security_camera_app.log")
+DEFAULT_MOTION_SENSITIVITY = 5
 
 
 logging.basicConfig(
@@ -99,12 +104,13 @@ class CameraDetectionWorker(QObject):
     finished = Signal(str)
     frame_ready = Signal(str, bytes)
 
-    def __init__(self, channel, rtsp_url, window_title, target_objects):
+    def __init__(self, channel, rtsp_url, window_title, target_objects, motion_sensitivity):
         super().__init__()
         self.channel = channel
         self.rtsp_url = rtsp_url
         self.window_title = window_title
         self.target_objects = target_objects
+        self.motion_sensitivity = motion_sensitivity
         self._stopped = False
 
     def stop(self):
@@ -118,6 +124,7 @@ class CameraDetectionWorker(QObject):
                 self.target_objects,
                 self.should_stop,
                 self.emit_frame,
+                self.motion_sensitivity,
             )
         except Exception as exc:
             logging.exception("Stream %s failed", self.channel)
@@ -212,17 +219,22 @@ class CameraSettingsDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Security Camera Setup")
-        self.setMinimumSize(520, 560)
+        self.setMinimumSize(760, 620)
 
         self.scan_thread = None
         self.scan_worker = None
         self.stream_workers = {}
         self.preview_windows = {}
+        self.camera_controls = {}
 
         self.username_input = QLineEdit()
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.Password)
         self.ip_input = QLineEdit()
+        guessed_ip = likely_dvr_ip()
+        if guessed_ip:
+            self.ip_input.setText(guessed_ip)
+            self.ip_input.setToolTip("Pre-filled from .env, a local network scan, or the default gateway.")
         self.port_input = QLineEdit(DEFAULT_RTSP_PORT)
         self.rtsp_path_template_input = QLineEdit(DEFAULT_RTSP_PATH_TEMPLATE)
         self.rtsp_path_template_input.setPlaceholderText("/Streaming/Channels/{channel}")
@@ -240,8 +252,9 @@ class CameraSettingsDialog(QDialog):
             self.object_checkboxes[object_name] = checkbox
 
         self.camera_list = QListWidget()
-        self.camera_list.setMinimumHeight(180)
-        self.camera_list.itemChanged.connect(self.toggle_stream)
+        self.camera_list.setMinimumHeight(240)
+        self.camera_list.setMinimumWidth(680)
+        self.camera_list.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
         self.scan_status = QLabel("Enter NVR details, then connect to discover streams.")
         self.scan_button = QPushButton("Connect")
         self.scan_button.clicked.connect(self.scan_cameras)
@@ -332,6 +345,7 @@ class CameraSettingsDialog(QDialog):
 
         self.stop_all_streams()
         self.camera_list.clear()
+        self.camera_controls.clear()
         self.hide_rtsp_template_input()
         self.scan_status.setText("Connecting: trying ONVIF discovery, then RTSP probing...")
         self.scan_button.setEnabled(False)
@@ -361,11 +375,51 @@ class CameraSettingsDialog(QDialog):
         self.scan_status.setText(message)
 
     def add_camera_item(self, label, stream_data):
-        item = QListWidgetItem(label)
+        item = QListWidgetItem()
         item.setData(Qt.UserRole, stream_data)
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(Qt.Unchecked)
+        item.setData(Qt.UserRole + 1, label)
+        item.setToolTip(label)
         self.camera_list.addItem(item)
+
+        stream_id = stream_data.stream_id if hasattr(stream_data, "stream_id") else str(stream_data).strip()
+        row_widget = QWidget()
+        row_widget.setMinimumHeight(50)
+        row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(8, 4, 28, 4)
+        row_layout.setSpacing(10)
+
+        stream_checkbox = QCheckBox()
+        stream_checkbox.setFixedWidth(24)
+        stream_checkbox.setMinimumHeight(30)
+        stream_checkbox.stateChanged.connect(lambda _state, list_item=item: self.toggle_stream(list_item))
+
+        stream_label = QLabel(label)
+        stream_label.setWordWrap(True)
+        stream_label.setMinimumHeight(32)
+        stream_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        sensitivity_label = QLabel("Sensitivity")
+        sensitivity_label.setMinimumWidth(72)
+        sensitivity_input = QSpinBox()
+        sensitivity_input.setRange(1, 10)
+        sensitivity_input.setValue(DEFAULT_MOTION_SENSITIVITY)
+        sensitivity_input.setFixedWidth(72)
+        sensitivity_input.setMinimumHeight(30)
+        sensitivity_input.setToolTip("1 is least sensitive. 10 is most sensitive. 5 matches the default.")
+
+        row_layout.addWidget(stream_checkbox)
+        row_layout.addWidget(stream_label, 1)
+        row_layout.addWidget(sensitivity_label)
+        row_layout.addWidget(sensitivity_input)
+        row_widget.setLayout(row_layout)
+
+        item.setSizeHint(QSize(0, 54))
+        self.camera_list.setItemWidget(item, row_widget)
+        self.camera_controls[stream_id] = {
+            "checkbox": stream_checkbox,
+            "label": label,
+            "sensitivity": sensitivity_input,
+        }
 
     def finish_scan(self, found_count):
         self.scan_button.setEnabled(True)
@@ -478,11 +532,43 @@ class CameraSettingsDialog(QDialog):
     def toggle_stream(self, item):
         stream = item.data(Qt.UserRole)
         stream_id = stream.stream_id if hasattr(stream, "stream_id") else str(stream).strip()
+        controls = self.camera_controls.get(stream_id)
+        if controls is None:
+            return
 
-        if item.checkState() == Qt.Checked:
-            self.start_stream(stream, item.text(), item)
+        if controls["checkbox"].isChecked():
+            self.start_stream(stream, self.item_label(item), item)
         else:
             self.stop_stream(stream_id)
+
+    def item_label(self, item):
+        return item.data(Qt.UserRole + 1) or ""
+
+    def uncheck_stream_item(self, item):
+        stream = item.data(Qt.UserRole)
+        stream_id = stream.stream_id if hasattr(stream, "stream_id") else str(stream).strip()
+        controls = self.camera_controls.get(stream_id)
+        if controls is None:
+            return
+
+        checkbox = controls["checkbox"]
+        checkbox.blockSignals(True)
+        checkbox.setChecked(False)
+        checkbox.blockSignals(False)
+
+    def item_motion_sensitivity(self, item):
+        stream = item.data(Qt.UserRole)
+        stream_id = stream.stream_id if hasattr(stream, "stream_id") else str(stream).strip()
+        controls = self.camera_controls.get(stream_id)
+        if controls is None:
+            return DEFAULT_MOTION_SENSITIVITY
+
+        return controls["sensitivity"].value()
+
+    def set_stream_sensitivity_enabled(self, stream_id, enabled):
+        controls = self.camera_controls.get(stream_id)
+        if controls is not None:
+            controls["sensitivity"].setEnabled(enabled)
 
     def start_stream(self, stream, label, item):
         stream_id = stream.stream_id if hasattr(stream, "stream_id") else str(stream).strip()
@@ -501,9 +587,7 @@ class CameraSettingsDialog(QDialog):
                 "Missing Details",
                 "Enter username, password, DVR/NVR IP, RTSP port, and RTSP path template before starting a stream.",
             )
-            self.camera_list.blockSignals(True)
-            item.setCheckState(Qt.Unchecked)
-            self.camera_list.blockSignals(False)
+            self.uncheck_stream_item(item)
             return
 
         if not target_objects:
@@ -512,9 +596,7 @@ class CameraSettingsDialog(QDialog):
                 "Missing Objects",
                 "Select at least one object to record.",
             )
-            self.camera_list.blockSignals(True)
-            item.setCheckState(Qt.Unchecked)
-            self.camera_list.blockSignals(False)
+            self.uncheck_stream_item(item)
             return
 
         try:
@@ -527,13 +609,12 @@ class CameraSettingsDialog(QDialog):
                 stream_url = build_rtsp_url(stream_settings, channel=channel)
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid RTSP Template", str(exc))
-            self.camera_list.blockSignals(True)
-            item.setCheckState(Qt.Unchecked)
-            self.camera_list.blockSignals(False)
+            self.uncheck_stream_item(item)
             return
 
         thread = QThread(self)
-        worker = CameraDetectionWorker(stream_id, stream_url, label, target_objects)
+        motion_sensitivity = self.item_motion_sensitivity(item)
+        worker = CameraDetectionWorker(stream_id, stream_url, label, target_objects, motion_sensitivity)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -550,6 +631,7 @@ class CameraSettingsDialog(QDialog):
             "worker": worker,
             "stopping": False,
         }
+        self.set_stream_sensitivity_enabled(stream_id, False)
         self.add_preview_window(stream_id, label)
         self.scan_status.setText(f"Started stream {label}.")
         thread.start()
@@ -577,6 +659,7 @@ class CameraSettingsDialog(QDialog):
 
     def finish_stream(self, channel):
         self.uncheck_channel(channel)
+        self.set_stream_sensitivity_enabled(channel, True)
         self.remove_preview_window(channel)
         self.scan_status.setText(f"Stopped stream {channel}.")
 
@@ -591,9 +674,7 @@ class CameraSettingsDialog(QDialog):
             if stream_id != channel:
                 continue
 
-            self.camera_list.blockSignals(True)
-            item.setCheckState(Qt.Unchecked)
-            self.camera_list.blockSignals(False)
+            self.uncheck_stream_item(item)
             break
 
     def show_stream_error(self, channel, error):
