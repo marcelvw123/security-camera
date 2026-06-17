@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import time
+from itertools import count
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -13,6 +14,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_cache_dir))
 
 import cv2
 from cloud_upload import upload_clip_async
+from gemma_analysis import analyze_clip_with_gemma
 from scenario_detector import ScenarioDetector, scenario_relevant_objects
 from video_compat import make_whatsapp_compatible_mp4
 
@@ -32,6 +34,7 @@ STREAM_RECONNECT_DELAY_SECONDS = 2
 READ_FAILURES_BEFORE_RECONNECT = 3
 PREVIEW_EVERY_N_FRAMES = 3
 JPEG_PREVIEW_QUALITY = 70
+_TRIGGER_COUNTER = count(1)
 
 
 def resource_path(filename):
@@ -47,6 +50,20 @@ def load_yolo_model():
     from ultralytics import YOLO
 
     return YOLO(resource_path(YOLO_MODEL_FILENAME))
+
+
+def new_trigger_id():
+    return f"ID{next(_TRIGGER_COUNTER):03d}"
+
+
+def log_trigger_step(trigger_id, step, message, *args):
+    if args:
+        message = message % args
+
+    if trigger_id:
+        logging.info("%s %s %s", trigger_id, step, message)
+    else:
+        logging.info("%s %s", step, message)
 
 
 def can_open_rtsp_channel(settings, channel):
@@ -138,8 +155,24 @@ def create_video_writer(clip_path, fps, size):
     raise RuntimeError("Could not create video writer")
 
 
-def upload_saved_clip(clip_path, source_name, detected_objects, clip_type, scenario_name):
+def upload_saved_clip(clip_path, source_name, detected_objects, clip_type, scenario_name, trigger_id=None):
+    clip_path = Path(clip_path)
+    log_trigger_step(trigger_id, "STEP_7_GEMMA_ANALYSIS_STARTED", "clip=%s", clip_path)
+    gemma_analysis = analyze_clip_with_gemma(clip_path, trigger_id=trigger_id)
+    if gemma_analysis:
+        log_trigger_step(
+            trigger_id,
+            "STEP_8_GEMMA_ANALYSIS_COMPLETED",
+            "break_in_likely=%r confidence=%r",
+            gemma_analysis.get("break_in_likely"),
+            gemma_analysis.get("confidence"),
+        )
+    else:
+        log_trigger_step(trigger_id, "STEP_8_GEMMA_ANALYSIS_SKIPPED", "clip=%s", clip_path)
+
+    log_trigger_step(trigger_id, "STEP_9_TRANSCODE_STARTED", "clip=%s", clip_path)
     compatible_clip_path = make_whatsapp_compatible_mp4(clip_path)
+    log_trigger_step(trigger_id, "STEP_10_TRANSCODE_COMPLETED", "clip=%s", compatible_clip_path)
     metadata = {
         "camera": source_name,
         "detected": sorted(detected_objects),
@@ -147,21 +180,33 @@ def upload_saved_clip(clip_path, source_name, detected_objects, clip_type, scena
         "detected_objects": sorted(detected_objects),
         "clip_type": clip_type,
         "scenario": scenario_name,
+        "trigger_id": trigger_id,
     }
+    if gemma_analysis:
+        metadata.update(
+            {
+                "gemma_scene_description": gemma_analysis.get("scene_description"),
+                "gemma_break_in_likely": gemma_analysis.get("break_in_likely"),
+                "gemma_confidence": gemma_analysis.get("confidence"),
+                "gemma_reasoning": gemma_analysis.get("reasoning"),
+            }
+        )
     upload_clip_async(str(compatible_clip_path), metadata)
+    log_trigger_step(trigger_id, "STEP_11_UPLOAD_QUEUED", "clip=%s", compatible_clip_path)
 
 
-def upload_non_scenario_clip(clip_path, source_name, detected_objects, clip_type, reason):
+def upload_non_scenario_clip(clip_path, source_name, detected_objects, clip_type, reason, trigger_id=None):
     if clip_path is None:
         return
 
-    logging.info("Uploading non-scenario clip %s: %s", clip_path, reason)
+    log_trigger_step(trigger_id, "STEP_6_CLIP_SAVED_NO_SCENARIO", "clip=%s reason=%s", clip_path, reason)
     upload_saved_clip(
         clip_path,
         source_name,
         detected_objects,
         clip_type,
         "no_scenario_detected",
+        trigger_id=trigger_id,
     )
 
 
@@ -358,6 +403,8 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
     active_clip_path = None
     active_clip_objects = set()
     active_clip_scenario = None
+    active_trigger_id = None
+    pending_trigger_id = None
     frames_left_in_clip = 0
     frame_count = 0
     consecutive_read_failures = 0
@@ -388,12 +435,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                 if writer is not None:
                     writer.release()
                     if active_clip_path is not None and active_clip_scenario is not None:
+                        log_trigger_step(active_trigger_id, "STEP_6_CLIP_SAVED", "clip=%s reason=stream_lost", active_clip_path)
                         upload_saved_clip(
                             active_clip_path,
                             window_title,
                             active_clip_objects,
                             "scenario_camera_detection",
                             active_clip_scenario,
+                            trigger_id=active_trigger_id,
                         )
                     elif active_clip_path is not None:
                         upload_non_scenario_clip(
@@ -402,11 +451,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                             active_clip_objects,
                             "camera_detection",
                             "stream lost before scenario matched",
+                            trigger_id=active_trigger_id,
                         )
                     writer = None
                     active_clip_path = None
                     active_clip_objects = set()
                     active_clip_scenario = None
+                    active_trigger_id = None
+                    pending_trigger_id = None
                     frames_left_in_clip = 0
                     scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
 
@@ -422,10 +474,21 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
             matched_objects = set()
             relevant_objects = set()
             scenario_match = None
+            detected_object_names = []
             annotated_frame = frame.copy()
             draw_motion_boxes(annotated_frame, motion_boxes)
 
             if motion_detected:
+                if writer is None and pending_trigger_id is None:
+                    pending_trigger_id = new_trigger_id()
+                    log_trigger_step(
+                        pending_trigger_id,
+                        "STEP_1_MOTION_DETECTED",
+                        "camera=%s motion_boxes=%s",
+                        window_title,
+                        len(motion_boxes),
+                    )
+
                 results = model(frame, verbose=False, conf=YOLO_CONFIDENCE)
 
                 annotated_frame = results[0].plot()
@@ -438,10 +501,28 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                 matched_objects = detected_objects & target_objects
                 relevant_objects = scenario_relevant_objects(detected_object_names)
                 scenario_match = scenario_detector.record_detection(window_title, detected_object_names)
+                if writer is None and pending_trigger_id:
+                    if detected_object_names:
+                        log_trigger_step(
+                            pending_trigger_id,
+                            "STEP_2_OBJECTS_DETECTED",
+                            "objects=%s",
+                            sorted(detected_objects),
+                        )
+                    else:
+                        log_trigger_step(pending_trigger_id, "STEP_2_NO_OBJECTS_DETECTED", "camera=%s", window_title)
 
             draw_detection_status(annotated_frame, motion_detected, matched_objects)
 
             if writer is None and relevant_objects:
+                if pending_trigger_id is None:
+                    pending_trigger_id = new_trigger_id()
+                log_trigger_step(
+                    pending_trigger_id,
+                    "STEP_3_RELEVANT_OBJECTS_DETECTED",
+                    "objects=%s",
+                    sorted(relevant_objects),
+                )
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 safe_window_title = "".join(
                     character if character.isalnum() else "_"
@@ -452,8 +533,25 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                 writer = create_video_writer(clip_path, fps, (width, height))
                 active_clip_path = clip_path
                 active_clip_objects = set(relevant_objects)
+                active_trigger_id = pending_trigger_id
+                pending_trigger_id = None
                 frames_left_in_clip = int(fps * CLIP_SECONDS)
-                logging.info("Started pending scenario clip for %s: %s", window_title, clip_path)
+                log_trigger_step(
+                    active_trigger_id,
+                    "STEP_4_CLIP_RECORDING_STARTED",
+                    "camera=%s clip=%s seconds=%s",
+                    window_title,
+                    clip_path,
+                    CLIP_SECONDS,
+                )
+            elif writer is None and pending_trigger_id and motion_detected:
+                log_trigger_step(
+                    pending_trigger_id,
+                    "STEP_3_NO_RELEVANT_OBJECTS_DETECTED",
+                    "objects=%s",
+                    sorted(detected_object_names),
+                )
+                pending_trigger_id = None
 
             if writer is not None:
                 active_clip_objects.update(relevant_objects)
@@ -461,7 +559,13 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
             if active_clip_scenario is None and scenario_match is not None:
                 active_clip_objects = set(scenario_match.objects)
                 active_clip_scenario = scenario_match.name
-                logging.info("Scenario matched for pending clip %s: %s", window_title, active_clip_path)
+                log_trigger_step(
+                    active_trigger_id,
+                    "STEP_5_SCENARIO_MATCHED",
+                    "scenario=%s clip=%s",
+                    active_clip_scenario,
+                    active_clip_path,
+                )
 
             if writer is not None:
                 writer.write(annotated_frame)
@@ -470,12 +574,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                 if frames_left_in_clip <= 0:
                     writer.release()
                     if active_clip_path is not None and active_clip_scenario is not None:
+                        log_trigger_step(active_trigger_id, "STEP_6_CLIP_SAVED", "clip=%s", active_clip_path)
                         upload_saved_clip(
                             active_clip_path,
                             window_title,
                             active_clip_objects,
                             "scenario_camera_detection",
                             active_clip_scenario,
+                            trigger_id=active_trigger_id,
                         )
                     elif active_clip_path is not None:
                         upload_non_scenario_clip(
@@ -484,11 +590,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                             active_clip_objects,
                             "camera_detection",
                             "20 second clip ended without scenario match",
+                            trigger_id=active_trigger_id,
                         )
                     writer = None
                     active_clip_path = None
                     active_clip_objects = set()
                     active_clip_scenario = None
+                    active_trigger_id = None
+                    pending_trigger_id = None
                     frames_left_in_clip = 0
                     scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
 
@@ -499,12 +608,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
         if writer is not None:
             writer.release()
             if active_clip_path is not None and active_clip_scenario is not None:
+                log_trigger_step(active_trigger_id, "STEP_6_CLIP_SAVED", "clip=%s reason=stream_stopped", active_clip_path)
                 upload_saved_clip(
                     active_clip_path,
                     window_title,
                     active_clip_objects,
                     "scenario_camera_detection",
                     active_clip_scenario,
+                    trigger_id=active_trigger_id,
                 )
             elif active_clip_path is not None:
                 upload_non_scenario_clip(
@@ -513,6 +624,7 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                     active_clip_objects,
                     "camera_detection",
                     "stream stopped before scenario matched",
+                    trigger_id=active_trigger_id,
                 )
 
         if cap is not None:
