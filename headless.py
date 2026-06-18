@@ -23,7 +23,8 @@ from security_camera_core import (
 
 LOG_FILE = "security_camera_headless.log"
 DEFAULT_MOTION_SENSITIVITY = 5
-HEADLESS_STREAM_CONFIG_FILE = Path("headless_streams.json")
+HEADLESS_CONFIG_FILE = Path("headless_config.json")
+LEGACY_HEADLESS_STREAM_CONFIG_FILE = Path("headless_streams.json")
 
 
 def configure_logging():
@@ -126,6 +127,46 @@ def build_settings():
     return settings
 
 
+def load_headless_config():
+    for config_path in (HEADLESS_CONFIG_FILE, LEGACY_HEADLESS_STREAM_CONFIG_FILE):
+        if not config_path.is_file():
+            continue
+
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logging.warning("Could not read %s: %s", config_path, exc)
+            continue
+
+        logging.info("Loaded headless config from %s", config_path)
+        return config, config_path
+
+    return None, None
+
+
+def settings_from_config(config):
+    if not isinstance(config, dict):
+        return None
+
+    settings = config.get("settings")
+    if not isinstance(settings, dict):
+        return None
+
+    normalized = {
+        "username": str(settings.get("username", "")).strip(),
+        "password": str(settings.get("password", "")),
+        "ip_address": str(settings.get("ip_address", "")).strip(),
+        "port": str(settings.get("port", DEFAULT_RTSP_PORT)).strip() or DEFAULT_RTSP_PORT,
+        "rtsp_path_template": str(settings.get("rtsp_path_template", DEFAULT_RTSP_PATH_TEMPLATE)).strip()
+        or DEFAULT_RTSP_PATH_TEMPLATE,
+    }
+    if not normalized["username"] or not normalized["password"] or not normalized["ip_address"]:
+        logging.warning("Saved headless config is missing username, password, or DVR/NVR IP.")
+        return None
+
+    return normalized
+
+
 def stream_choice_text(streams):
     lines = ["Discovered streams:"]
     for index, stream in enumerate(streams, start=1):
@@ -226,14 +267,8 @@ def prompt_stream_sensitivities(streams):
     }
 
 
-def load_headless_stream_config(all_streams):
-    if not HEADLESS_STREAM_CONFIG_FILE.is_file():
-        return None
-
-    try:
-        config = json.loads(HEADLESS_STREAM_CONFIG_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logging.warning("Could not read %s: %s", HEADLESS_STREAM_CONFIG_FILE, exc)
+def load_headless_stream_config(all_streams, config, config_path):
+    if not config:
         return None
 
     try:
@@ -260,15 +295,36 @@ def load_headless_stream_config(all_streams):
         if missing_stream_ids:
             raise ValueError(f"configured stream(s) not found: {', '.join(missing_stream_ids)}")
 
-        logging.info("Loaded headless stream config from %s", HEADLESS_STREAM_CONFIG_FILE)
+        logging.info("Loaded headless stream config from %s", config_path)
         return selected_streams, stream_sensitivities
     except (AttributeError, TypeError, ValueError) as exc:
-        logging.warning("Invalid %s: %s", HEADLESS_STREAM_CONFIG_FILE, exc)
+        logging.warning("Invalid stream settings in %s: %s", config_path, exc)
         return None
 
 
-def save_headless_stream_config(streams, stream_sensitivities):
+def write_private_json(path, config):
+    data = json.dumps(config, indent=2)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(data)
+            file.write("\n")
+    finally:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            logging.warning("Could not restrict permissions on %s: %s", path, exc)
+
+
+def save_headless_config(settings, streams, stream_sensitivities):
     config = {
+        "settings": {
+            "username": settings["username"],
+            "password": settings["password"],
+            "ip_address": settings["ip_address"],
+            "port": settings["port"],
+            "rtsp_path_template": settings["rtsp_path_template"],
+        },
         "streams": [
             {
                 "stream_id": stream.stream_id,
@@ -280,19 +336,19 @@ def save_headless_stream_config(streams, stream_sensitivities):
     }
 
     try:
-        HEADLESS_STREAM_CONFIG_FILE.write_text(
-            json.dumps(config, indent=2),
-            encoding="utf-8",
-        )
-        logging.info("Saved headless stream config to %s", HEADLESS_STREAM_CONFIG_FILE)
+        write_private_json(HEADLESS_CONFIG_FILE, config)
+        logging.info("Saved headless config to %s with owner-only file permissions", HEADLESS_CONFIG_FILE)
     except OSError as exc:
-        logging.warning("Could not save %s: %s", HEADLESS_STREAM_CONFIG_FILE, exc)
+        logging.warning("Could not save %s: %s", HEADLESS_CONFIG_FILE, exc)
 
 
 def main():
     configure_logging()
 
-    settings = build_settings()
+    saved_config, saved_config_path = load_headless_config()
+    settings = settings_from_config(saved_config)
+    if settings is None:
+        settings = build_settings()
 
     logging.info("Discovering streams for %s", settings["ip_address"])
     streams = discover_nvr_streams(
@@ -304,13 +360,15 @@ def main():
         logging.error("No camera streams discovered.")
         return 1
 
-    configured_streams = load_headless_stream_config(streams)
+    configured_streams = load_headless_stream_config(streams, saved_config, saved_config_path)
     if configured_streams is None:
         streams = select_streams(streams)
         stream_sensitivities = prompt_stream_sensitivities(streams)
-        save_headless_stream_config(streams, stream_sensitivities)
+        save_headless_config(settings, streams, stream_sensitivities)
     else:
         streams, stream_sensitivities = configured_streams
+        if saved_config_path != HEADLESS_CONFIG_FILE or settings_from_config(saved_config) is None:
+            save_headless_config(settings, streams, stream_sensitivities)
 
     stop_event = threading.Event()
 

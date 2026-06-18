@@ -1,0 +1,10 @@
+[Unit]
+Description=Stop security camera detector at 05:00
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+Unit=security-camera-stop.service
+
+[Install]
+WantedBy=timers.target

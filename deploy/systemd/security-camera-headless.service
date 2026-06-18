@@ -1,0 +1,16 @@
+[Unit]
+Description=Security camera headless detector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=marcelvw
+WorkingDirectory=/home/marcelvw/securitycamera
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/marcelvw/securitycamera/.venv/bin/python /home/marcelvw/securitycamera/headless.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

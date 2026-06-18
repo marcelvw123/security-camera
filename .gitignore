@@ -14,6 +14,8 @@ env/
 .env
 .env.*
 !.env.example
+headless_config.json
+headless_streams.json
 
 # IDE and OS files
 .idea/
@@ -38,3 +40,4 @@ dist/
 
 # App logs
 security_camera_app.log
+security_camera_headless.log

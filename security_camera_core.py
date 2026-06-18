@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -14,16 +15,55 @@ matplotlib_cache_dir.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_cache_dir))
 
 import cv2
+from app_config import load_dotenv
 from cloud_upload import upload_clip_async
 from gemma_analysis import analyze_clip_with_gemma
 from scenario_detector import ScenarioDetector, scenario_relevant_objects
 from video_compat import make_whatsapp_compatible_mp4
 
 
+load_dotenv()
+
+
+def int_env(name, default, min_value=None, max_value=None):
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        logging.warning("Invalid %s value %r; using %s", name, value, default)
+        return default
+
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(max_value, parsed)
+    return parsed
+
+
+def float_env(name, default, min_value=None, max_value=None):
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+
+    try:
+        parsed = float(value)
+    except ValueError:
+        logging.warning("Invalid %s value %r; using %s", name, value, default)
+        return default
+
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(max_value, parsed)
+    return parsed
+
+
 MIN_MOTION_AREA = 1000
 MAX_MOTION_AREA_RATIO = 0.60
 MAX_MOTION_BOX_ASPECT_RATIO = 8.0
-MIN_OBJECT_MOTION_OVERLAP_RATIO = 0.08
 CLIP_SECONDS = 20
 YOLO_MODEL_FILENAME = "yolo11s.pt"
 YOLO_CONFIDENCE = 0.55
@@ -34,10 +74,11 @@ DEFAULT_TARGET_OBJECTS = {"person"}
 AVAILABLE_TARGET_OBJECTS = ("car", "person", "truck", "bus", "motorcycle")
 DEFAULT_RTSP_PORT = "554"
 DEFAULT_RTSP_PATH_TEMPLATE = "/Streaming/Channels/{channel}"
-STREAM_OPEN_TIMEOUT_MS = 1200
-STREAM_READ_TIMEOUT_MS = 1200
-STREAM_RECONNECT_DELAY_SECONDS = 2
-READ_FAILURES_BEFORE_RECONNECT = 3
+STREAM_OPEN_TIMEOUT_MS = int_env("RTSP_OPEN_TIMEOUT_MS", 5000, min_value=500)
+STREAM_READ_TIMEOUT_MS = int_env("RTSP_READ_TIMEOUT_MS", 5000, min_value=500)
+STREAM_RECONNECT_DELAY_SECONDS = float_env("RTSP_RECONNECT_DELAY_SECONDS", 2, min_value=0.1)
+READ_FAILURES_BEFORE_RECONNECT = int_env("RTSP_READ_FAILURES_BEFORE_RECONNECT", 10, min_value=1)
+DEFAULT_RECORDING_FPS = int_env("RECORDING_FPS", 20, min_value=1, max_value=60)
 PREVIEW_EVERY_N_FRAMES = 3
 JPEG_PREVIEW_QUALITY = 70
 _TRIGGER_COUNTER = count(1)
@@ -47,7 +88,6 @@ _TRIGGER_COUNTER = count(1)
 class MotionSensitivityConfig:
     level: int
     min_motion_area: int
-    min_object_motion_overlap_ratio: float
 
 
 def resource_path(filename):
@@ -86,7 +126,6 @@ def motion_sensitivity_config(level=None):
     return MotionSensitivityConfig(
         level=level,
         min_motion_area=max(1, int(MIN_MOTION_AREA * threshold_multiplier)),
-        min_object_motion_overlap_ratio=min(1.0, MIN_OBJECT_MOTION_OVERLAP_RATIO * threshold_multiplier),
     )
 
 
@@ -165,6 +204,12 @@ def wait_before_reconnect(stop_requested):
         time.sleep(0.1)
 
 
+def normalized_recording_fps(capture_fps):
+    if not capture_fps or capture_fps <= 0 or capture_fps > 60:
+        return DEFAULT_RECORDING_FPS
+    return capture_fps
+
+
 def create_video_writer(clip_path, fps, size):
     for codec in ("avc1", "H264", "mp4v"):
         fourcc = cv2.VideoWriter_fourcc(*codec)
@@ -187,7 +232,8 @@ def upload_saved_clip(clip_path, source_name, detected_objects, clip_type, scena
         log_trigger_step(
             trigger_id,
             "STEP_8_GEMMA_ANALYSIS_COMPLETED",
-            "break_in_likely=%r confidence=%r",
+            "scenarios=%r break_in_likely=%r confidence=%r",
+            gemma_analysis.get("identified_scenarios"),
             gemma_analysis.get("break_in_likely"),
             gemma_analysis.get("confidence"),
         )
@@ -210,9 +256,12 @@ def upload_saved_clip(clip_path, source_name, detected_objects, clip_type, scena
         metadata.update(
             {
                 "gemma_scene_description": gemma_analysis.get("scene_description"),
+                "gemma_identified_scenarios": gemma_analysis.get("identified_scenarios"),
+                "gemma_scenario_reasoning": gemma_analysis.get("scenario_reasoning"),
                 "gemma_break_in_likely": gemma_analysis.get("break_in_likely"),
                 "gemma_confidence": gemma_analysis.get("confidence"),
                 "gemma_reasoning": gemma_analysis.get("reasoning"),
+                "gemma_finish_reason": gemma_analysis.get("finish_reason"),
             }
         )
     upload_clip_async(str(compatible_clip_path), metadata)
@@ -299,41 +348,6 @@ def draw_motion_boxes(frame, motion_boxes):
         cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 255), 2)
 
 
-def boxes_overlap(box_a, box_b):
-    left_a, top_a, right_a, bottom_a = box_a
-    left_b, top_b, right_b, bottom_b = box_b
-    return left_a < right_b and right_a > left_b and top_a < bottom_b and bottom_a > top_b
-
-
-def overlap_area(box_a, box_b):
-    left_a, top_a, right_a, bottom_a = box_a
-    left_b, top_b, right_b, bottom_b = box_b
-    overlap_width = max(0, min(right_a, right_b) - max(left_a, left_b))
-    overlap_height = max(0, min(bottom_a, bottom_b) - max(top_a, top_b))
-    return overlap_width * overlap_height
-
-
-def motion_box_to_xyxy(motion_box):
-    x, y, width, height = motion_box
-    return x, y, x + width, y + height
-
-
-def detection_box_to_xyxy(box):
-    left, top, right, bottom = box.xyxy[0].tolist()
-    return int(left), int(top), int(right), int(bottom)
-
-
-def detection_overlaps_motion(box, motion_boxes, sensitivity_config=None):
-    sensitivity_config = sensitivity_config or motion_sensitivity_config()
-    detection_box = detection_box_to_xyxy(box)
-    detection_area = max(1, (detection_box[2] - detection_box[0]) * (detection_box[3] - detection_box[1]))
-    total_overlap_area = sum(
-        overlap_area(detection_box, motion_box_to_xyxy(motion_box))
-        for motion_box in motion_boxes
-    )
-    return total_overlap_area / detection_area >= sensitivity_config.min_object_motion_overlap_ratio
-
-
 def draw_detection_status(frame, motion_detected, matched_objects):
     status_lines = [
         f"Motion: {'YES' if motion_detected else 'NO'}",
@@ -345,28 +359,42 @@ def draw_detection_status(frame, motion_detected, matched_objects):
         cv2.putText(frame, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
 
-def save_trigger_debug_frame(frame, trigger_id, source_name, objects):
+def safe_file_stem(name):
+    stem = str(name or "").strip()
+    stem = re.sub(r"\s*\([^)]*(?:/|rtsp://)[^)]*\)\s*", " ", stem)
+    stem = re.sub(r"\s+-\s+(?:/|rtsp://).*$", "", stem)
+    stem = re.sub(r"(?:/|rtsp://).*$", "", stem)
+    stem = "".join(
+        character if character.isalnum() else "_"
+        for character in stem
+    ).strip("_")
+    stem = re.sub(r"_+", "_", stem)
+    return stem or "camera"
+
+
+def save_trigger_debug_frame(annotated_frame, raw_frame, trigger_id, source_name, objects):
     DEBUG_FRAME_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_source_name = "".join(
-        character if character.isalnum() else "_"
-        for character in source_name
-    ).strip("_")
+    safe_source_name = safe_file_stem(source_name)
     safe_objects = "_".join(sorted(objects)) or "objects"
-    debug_frame_path = DEBUG_FRAME_DIR / f"{trigger_id}_{safe_source_name}_{safe_objects}_{timestamp}.jpg"
-    if cv2.imwrite(str(debug_frame_path), frame):
-        log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVED", "image=%s", debug_frame_path)
+    annotated_frame_path = DEBUG_FRAME_DIR / f"{trigger_id}_{safe_source_name}_{safe_objects}_{timestamp}.jpg"
+    raw_frame_path = DEBUG_FRAME_DIR / f"raw_{trigger_id}_{safe_source_name}_{safe_objects}_{timestamp}.jpg"
+
+    if cv2.imwrite(str(annotated_frame_path), annotated_frame):
+        log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVED", "image=%s", annotated_frame_path)
     else:
-        log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVE_FAILED", "image=%s", debug_frame_path)
+        log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVE_FAILED", "image=%s", annotated_frame_path)
+
+    if cv2.imwrite(str(raw_frame_path), raw_frame):
+        log_trigger_step(trigger_id, "STEP_3_RAW_DEBUG_FRAME_SAVED", "image=%s", raw_frame_path)
+    else:
+        log_trigger_step(trigger_id, "STEP_3_RAW_DEBUG_FRAME_SAVE_FAILED", "image=%s", raw_frame_path)
 
 
 def save_scenario_frame(frame, trigger_id, source_name, scenario_name):
     SCENARIO_FRAME_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_source_name = "".join(
-        character if character.isalnum() else "_"
-        for character in source_name
-    ).strip("_")
+    safe_source_name = safe_file_stem(source_name)
     safe_scenario_name = "".join(
         character if character.isalnum() else "_"
         for character in scenario_name
@@ -393,15 +421,13 @@ def run_video_clip_detection(video_path, target_objects, stop_requested, frame_c
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video clip: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0:
-        fps = 20
+    fps = normalized_recording_fps(cap.get(cv2.CAP_PROP_FPS))
     frame_delay = min(1 / fps, 0.1)
     writer = None
     clip_path = None
     clip_objects = set()
     scenario_match = None
-    frames_left_in_clip = 0
+    clip_end_time = 0.0
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -427,15 +453,12 @@ def run_video_clip_detection(video_path, target_objects, stop_requested, frame_c
 
             if writer is None and relevant_objects:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_video_name = "".join(
-                    character if character.isalnum() else "_"
-                    for character in Path(video_path).stem
-                ).strip("_")
+                safe_video_name = safe_file_stem(Path(video_path).stem)
                 clip_path = OUTPUT_DIR / f"pending_scenario_{safe_video_name}_{timestamp}.mp4"
                 height, width = annotated_frame.shape[:2]
                 writer = create_video_writer(clip_path, fps, (width, height))
                 clip_objects = set(relevant_objects)
-                frames_left_in_clip = int(fps * CLIP_SECONDS)
+                clip_end_time = time.monotonic() + CLIP_SECONDS
                 logging.info("Started pending scenario video clip: %s", clip_path)
 
             if writer is not None:
@@ -447,9 +470,8 @@ def run_video_clip_detection(video_path, target_objects, stop_requested, frame_c
 
             if writer is not None:
                 writer.write(annotated_frame)
-                frames_left_in_clip -= 1
 
-                if frames_left_in_clip <= 0:
+                if time.monotonic() >= clip_end_time:
                     writer.release()
                     if clip_path is not None and scenario_match is not None:
                         upload_saved_clip(
@@ -472,7 +494,7 @@ def run_video_clip_detection(video_path, target_objects, stop_requested, frame_c
                     clip_path = None
                     clip_objects = set()
                     scenario_match = None
-                    frames_left_in_clip = 0
+                    clip_end_time = 0.0
                     scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
             emit_preview_frame(annotated_frame, frame_callback)
             time.sleep(frame_delay)
@@ -514,20 +536,21 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
     cap = None
     fps = 20
     writer = None
+    raw_writer = None
     active_clip_path = None
+    active_raw_clip_path = None
     active_clip_objects = set()
     active_clip_scenario = None
     active_trigger_id = None
     pending_trigger_id = None
-    frames_left_in_clip = 0
+    clip_end_time = 0.0
     frame_count = 0
     consecutive_read_failures = 0
     logging.info(
-        "Motion sensitivity for %s: level=%s min_motion_area=%s min_object_motion_overlap_ratio=%.3f",
+        "Motion sensitivity for %s: level=%s min_motion_area=%s",
         window_title,
         sensitivity_config.level,
         sensitivity_config.min_motion_area,
-        sensitivity_config.min_object_motion_overlap_ratio,
     )
 
     try:
@@ -539,11 +562,18 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                     wait_before_reconnect(stop_requested)
                     continue
 
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                if not fps or fps <= 0:
-                    fps = 20
+                reported_fps = cap.get(cv2.CAP_PROP_FPS)
+                fps = normalized_recording_fps(reported_fps)
                 consecutive_read_failures = 0
-                logging.info("Connected RTSP stream %s", window_title)
+                logging.info(
+                    "Connected RTSP stream %s reported_fps=%s recording_fps=%s open_timeout_ms=%s read_timeout_ms=%s read_failures_before_reconnect=%s",
+                    window_title,
+                    reported_fps,
+                    fps,
+                    STREAM_OPEN_TIMEOUT_MS,
+                    STREAM_READ_TIMEOUT_MS,
+                    READ_FAILURES_BEFORE_RECONNECT,
+                )
 
             ret, frame = cap.read()
 
@@ -552,11 +582,23 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                 if consecutive_read_failures < READ_FAILURES_BEFORE_RECONNECT:
                     continue
 
-                logging.warning("Lost RTSP stream %s. Reconnecting...", window_title)
+                logging.warning(
+                    "Lost RTSP stream %s after %s consecutive read failures. Reconnecting...",
+                    window_title,
+                    consecutive_read_failures,
+                )
                 if writer is not None:
                     writer.release()
+                    if raw_writer is not None:
+                        raw_writer.release()
                     if active_clip_path is not None and active_clip_scenario is not None:
-                        log_trigger_step(active_trigger_id, "STEP_6_CLIP_SAVED", "clip=%s reason=stream_lost", active_clip_path)
+                        log_trigger_step(
+                            active_trigger_id,
+                            "STEP_6_CLIP_SAVED",
+                            "clip=%s raw_clip=%s reason=stream_lost",
+                            active_clip_path,
+                            active_raw_clip_path,
+                        )
                         upload_saved_clip(
                             active_clip_path,
                             window_title,
@@ -566,6 +608,12 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                             trigger_id=active_trigger_id,
                         )
                     elif active_clip_path is not None:
+                        log_trigger_step(
+                            active_trigger_id,
+                            "STEP_6_RAW_CLIP_SAVED",
+                            "raw_clip=%s",
+                            active_raw_clip_path,
+                        )
                         upload_non_scenario_clip(
                             active_clip_path,
                             window_title,
@@ -575,12 +623,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                             trigger_id=active_trigger_id,
                         )
                     writer = None
+                    raw_writer = None
                     active_clip_path = None
+                    active_raw_clip_path = None
                     active_clip_objects = set()
                     active_clip_scenario = None
                     active_trigger_id = None
                     pending_trigger_id = None
-                    frames_left_in_clip = 0
+                    clip_end_time = 0.0
                     scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
 
                 cap.release()
@@ -594,7 +644,6 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
             motion_detected = bool(motion_boxes)
             matched_objects = set()
             relevant_objects = set()
-            moving_target_objects = set()
             scenario_match = None
             detected_object_names = []
             annotated_frame = frame.copy()
@@ -619,15 +668,8 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                     model.names[int(box.cls[0])]
                     for box in results[0].boxes
                 ]
-                moving_detected_object_names = [
-                    model.names[int(box.cls[0])]
-                    for box in results[0].boxes
-                    if detection_overlaps_motion(box, motion_boxes, sensitivity_config)
-                ]
                 detected_objects = set(detected_object_names)
-                moving_detected_objects = set(moving_detected_object_names)
                 matched_objects = detected_objects & target_objects
-                moving_target_objects = moving_detected_objects & target_objects
                 relevant_objects = scenario_relevant_objects(detected_object_names)
                 scenario_match = scenario_detector.record_detection(window_title, detected_object_names)
                 if writer is None and pending_trigger_id:
@@ -643,49 +685,51 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
 
             draw_detection_status(annotated_frame, motion_detected, matched_objects)
 
-            if writer is None and moving_target_objects:
+            if writer is None and matched_objects:
                 if pending_trigger_id is None:
                     pending_trigger_id = new_trigger_id()
                 log_trigger_step(
                     pending_trigger_id,
-                    "STEP_3_MOVING_TARGET_OBJECTS_DETECTED",
+                    "STEP_3_TARGET_OBJECTS_DETECTED",
                     "objects=%s",
-                    sorted(moving_target_objects),
+                    sorted(matched_objects),
                 )
                 save_trigger_debug_frame(
                     annotated_frame,
+                    frame,
                     pending_trigger_id,
                     window_title,
-                    moving_target_objects,
+                    matched_objects,
                 )
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_window_title = "".join(
-                    character if character.isalnum() else "_"
-                    for character in window_title
-                ).strip("_")
+                safe_window_title = safe_file_stem(window_title)
                 clip_path = OUTPUT_DIR / f"pending_scenario_{safe_window_title}_{timestamp}.mp4"
+                raw_clip_path = OUTPUT_DIR / f"raw_pending_scenario_{safe_window_title}_{timestamp}.mp4"
                 height, width = annotated_frame.shape[:2]
                 writer = create_video_writer(clip_path, fps, (width, height))
+                raw_writer = create_video_writer(raw_clip_path, fps, (width, height))
                 active_clip_path = clip_path
-                active_clip_objects = set(moving_target_objects)
+                active_raw_clip_path = raw_clip_path
+                active_clip_objects = set(relevant_objects)
                 active_trigger_id = pending_trigger_id
                 pending_trigger_id = None
-                frames_left_in_clip = int(fps * CLIP_SECONDS)
+                clip_end_time = time.monotonic() + CLIP_SECONDS
                 log_trigger_step(
                     active_trigger_id,
                     "STEP_4_CLIP_RECORDING_STARTED",
-                    "camera=%s clip=%s seconds=%s",
+                    "camera=%s clip=%s raw_clip=%s seconds=%s",
                     window_title,
                     clip_path,
+                    raw_clip_path,
                     CLIP_SECONDS,
                 )
             elif writer is None and pending_trigger_id and motion_detected:
                 log_trigger_step(
                     pending_trigger_id,
-                    "STEP_3_NO_MOVING_TARGET_OBJECTS_DETECTED",
-                    "detected_objects=%s moving_target_objects=%s",
+                    "STEP_3_NO_TARGET_OBJECTS_DETECTED",
+                    "detected_objects=%s target_objects=%s",
                     sorted(detected_object_names),
-                    sorted(moving_target_objects),
+                    sorted(target_objects),
                 )
                 pending_trigger_id = None
 
@@ -711,12 +755,21 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
 
             if writer is not None:
                 writer.write(annotated_frame)
-                frames_left_in_clip -= 1
+                if raw_writer is not None:
+                    raw_writer.write(frame)
 
-                if frames_left_in_clip <= 0:
+                if time.monotonic() >= clip_end_time:
                     writer.release()
+                    if raw_writer is not None:
+                        raw_writer.release()
                     if active_clip_path is not None and active_clip_scenario is not None:
-                        log_trigger_step(active_trigger_id, "STEP_6_CLIP_SAVED", "clip=%s", active_clip_path)
+                        log_trigger_step(
+                            active_trigger_id,
+                            "STEP_6_CLIP_SAVED",
+                            "clip=%s raw_clip=%s",
+                            active_clip_path,
+                            active_raw_clip_path,
+                        )
                         upload_saved_clip(
                             active_clip_path,
                             window_title,
@@ -726,6 +779,12 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                             trigger_id=active_trigger_id,
                         )
                     elif active_clip_path is not None:
+                        log_trigger_step(
+                            active_trigger_id,
+                            "STEP_6_RAW_CLIP_SAVED",
+                            "raw_clip=%s",
+                            active_raw_clip_path,
+                        )
                         upload_non_scenario_clip(
                             active_clip_path,
                             window_title,
@@ -735,12 +794,14 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                             trigger_id=active_trigger_id,
                         )
                     writer = None
+                    raw_writer = None
                     active_clip_path = None
+                    active_raw_clip_path = None
                     active_clip_objects = set()
                     active_clip_scenario = None
                     active_trigger_id = None
                     pending_trigger_id = None
-                    frames_left_in_clip = 0
+                    clip_end_time = 0.0
                     scenario_detector = ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
 
             frame_count += 1
@@ -749,8 +810,16 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
     finally:
         if writer is not None:
             writer.release()
+            if raw_writer is not None:
+                raw_writer.release()
             if active_clip_path is not None and active_clip_scenario is not None:
-                log_trigger_step(active_trigger_id, "STEP_6_CLIP_SAVED", "clip=%s reason=stream_stopped", active_clip_path)
+                log_trigger_step(
+                    active_trigger_id,
+                    "STEP_6_CLIP_SAVED",
+                    "clip=%s raw_clip=%s reason=stream_stopped",
+                    active_clip_path,
+                    active_raw_clip_path,
+                )
                 upload_saved_clip(
                     active_clip_path,
                     window_title,
@@ -760,6 +829,12 @@ def run_detection(rtsp_url, window_title, target_objects, stop_requested, frame_
                     trigger_id=active_trigger_id,
                 )
             elif active_clip_path is not None:
+                log_trigger_step(
+                    active_trigger_id,
+                    "STEP_6_RAW_CLIP_SAVED",
+                    "raw_clip=%s",
+                    active_raw_clip_path,
+                )
                 upload_non_scenario_clip(
                     active_clip_path,
                     window_title,

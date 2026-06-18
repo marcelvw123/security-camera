@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
@@ -19,13 +20,34 @@ DEFAULT_JPEG_QUALITY = 75
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_MODEL = "gemma-4"
-PROMPT = """
+ALLOWED_SCENARIOS = (
+    "person_after_23h00_within_20s",
+    "two_or_more_persons_within_20s",
+    "vehicle_person_within_20s",
+)
+SCENARIO_TEXT = """
+Configured security scenarios:
+- person_after_23h00_within_20s: one or more people are visible when the local clip timestamp is 23:00 or later, or before 05:00.
+- two_or_more_persons_within_20s: two or more people are visible in the clip, preferably in the same frame or clearly within the sampled clip sequence.
+- vehicle_person_within_20s: at least one person and at least one vehicle are visible in the sampled clip sequence.
+""".strip()
+PROMPT_TEMPLATE = """
 You are analyzing a security camera clip from a home or business.
 Describe the visible scene and decide whether any people appear to be trying to break in.
 Consider suspicious signs such as forced entry, checking doors or windows, hiding, tools,
 climbing fences, damaging property, or coordinated intrusion behavior.
+
+Clip metadata:
+- local_clip_timestamp: {local_clip_timestamp}
+
+{scenario_text}
+
+Identify only scenarios that are supported by the visible frames and metadata.
+Use the local_clip_timestamp for time-based scenarios.
 Return only JSON with these fields:
 scene_description: string
+identified_scenarios: array of strings, using only these values: {allowed_scenarios}
+scenario_reasoning: string
 break_in_likely: boolean
 confidence: number from 0 to 1
 reasoning: string
@@ -90,7 +112,8 @@ def analyze_clip_with_gemma(clip_path: Path, trigger_id: Optional[str] = None) -
         logging.warning("Gemma clip analysis skipped because no frames could be sampled from %s", clip_path)
         return None
 
-    payload = build_gemma_payload(config, frame_data_urls)
+    prompt = build_analysis_prompt(clip_path)
+    payload = build_gemma_payload(config, frame_data_urls, prompt)
     try:
         log_gemma(trigger_id, "STEP_7_GEMMA_REQUEST_SENT", "clip=%s", clip_path)
         response = post_json(config.api_url, payload, timeout_seconds=config.timeout_seconds)
@@ -113,9 +136,10 @@ def analyze_clip_with_gemma(clip_path: Path, trigger_id: Optional[str] = None) -
     log_gemma(
         trigger_id,
         "STEP_8_GEMMA_PARSED_ANALYSIS",
-        "clip=%s scene=%r break_in_likely=%r confidence=%r reasoning=%r finish_reason=%r",
+        "clip=%s scene=%r scenarios=%r break_in_likely=%r confidence=%r reasoning=%r finish_reason=%r",
         clip_path,
         analysis.get("scene_description"),
+        analysis.get("identified_scenarios"),
         analysis.get("break_in_likely"),
         analysis.get("confidence"),
         analysis.get("reasoning"),
@@ -195,8 +219,23 @@ def encode_frame_as_data_url(frame, jpeg_quality: int) -> Optional[str]:
     return f"data:image/jpeg;base64,{image_base64}"
 
 
-def build_gemma_payload(config: GemmaAnalysisConfig, frame_data_urls: List[str]) -> Dict[str, Any]:
-    content: List[Dict[str, Any]] = [{"type": "text", "text": PROMPT}]
+def build_analysis_prompt(clip_path: Path) -> str:
+    return PROMPT_TEMPLATE.format(
+        local_clip_timestamp=local_clip_timestamp(clip_path),
+        scenario_text=SCENARIO_TEXT,
+        allowed_scenarios=", ".join(ALLOWED_SCENARIOS),
+    )
+
+
+def local_clip_timestamp(clip_path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(clip_path.stat().st_mtime).isoformat(timespec="seconds")
+    except OSError:
+        return "unknown"
+
+
+def build_gemma_payload(config: GemmaAnalysisConfig, frame_data_urls: List[str], prompt: str) -> Dict[str, Any]:
+    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     content.extend(
         {
             "type": "image_url",
@@ -271,6 +310,8 @@ def parse_analysis_content(content: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {
             "scene_description": content,
+            "identified_scenarios": [],
+            "scenario_reasoning": "",
             "break_in_likely": None,
             "confidence": None,
             "reasoning": "Gemma did not return parseable JSON.",
@@ -278,15 +319,39 @@ def parse_analysis_content(content: str) -> Dict[str, Any]:
 
     return {
         "scene_description": str(parsed.get("scene_description", "")).strip(),
+        "identified_scenarios": normalize_identified_scenarios(parsed.get("identified_scenarios")),
+        "scenario_reasoning": str(parsed.get("scenario_reasoning", "")).strip(),
         "break_in_likely": parsed.get("break_in_likely"),
         "confidence": parsed.get("confidence"),
         "reasoning": str(parsed.get("reasoning", "")).strip(),
     }
 
 
+def normalize_identified_scenarios(value: Any) -> List[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        return []
+
+    allowed = set(ALLOWED_SCENARIOS)
+    normalized = []
+    for item in values:
+        scenario = str(item).strip()
+        if scenario in allowed and scenario not in normalized:
+            normalized.append(scenario)
+    return normalized
+
+
 def print_gemma_analysis(clip_path: Path, analysis: Dict[str, Any]) -> None:
     print(f"\nGemma analysis for {clip_path}:")
     print(f"Scene: {analysis.get('scene_description')}")
+    scenarios = analysis.get("identified_scenarios") or []
+    print(f"Identified scenarios: {', '.join(scenarios) if scenarios else 'none'}")
+    scenario_reasoning = analysis.get("scenario_reasoning")
+    if scenario_reasoning:
+        print(f"Scenario reasoning: {scenario_reasoning}")
     print(f"Break-in likely: {analysis.get('break_in_likely')}")
     print(f"Confidence: {analysis.get('confidence')}")
     print(f"Reasoning: {analysis.get('reasoning')}")

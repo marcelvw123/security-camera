@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop security camera headless detector
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl stop security-camera-headless.service
