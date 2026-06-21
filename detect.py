@@ -5,22 +5,23 @@ from pathlib import Path
 
 from camera_discovery import DiscoveredStream, discover_nvr_streams
 from network_guess import likely_dvr_ip
-from PySide6.QtCore import QObject, Qt, QThread, Signal, QSize
+from PySide6.QtCore import QObject, Qt, QThread, Signal, QSize, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QCheckBox,
+    QGroupBox,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QSizePolicy,
     QSpinBox,
     QVBoxLayout,
@@ -103,6 +104,8 @@ class CameraDetectionWorker(QObject):
     error = Signal(str, str)
     finished = Signal(str)
     frame_ready = Signal(str, bytes)
+    status = Signal(str, str)
+    analysis = Signal(str, str, str, int)
 
     def __init__(self, channel, rtsp_url, window_title, target_objects, motion_sensitivity):
         super().__init__()
@@ -125,6 +128,8 @@ class CameraDetectionWorker(QObject):
                 self.should_stop,
                 self.emit_frame,
                 self.motion_sensitivity,
+                self.emit_status,
+                self.emit_analysis,
             )
         except Exception as exc:
             logging.exception("Stream %s failed", self.channel)
@@ -137,6 +142,19 @@ class CameraDetectionWorker(QObject):
 
     def emit_frame(self, frame_bytes):
         self.frame_ready.emit(self.channel, frame_bytes)
+
+    def emit_status(self, message):
+        self.status.emit(self.channel, message)
+
+    def emit_analysis(self, clip_name, message, progress):
+        logging.info(
+            "Analysis UI event channel=%s clip=%s progress=%s message=%s",
+            self.channel,
+            clip_name,
+            progress,
+            message,
+        )
+        self.analysis.emit(self.channel, clip_name, message, progress)
 
 
 class VideoClipDetectionWorker(QObject):
@@ -219,7 +237,7 @@ class CameraSettingsDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Security Camera Setup")
-        self.setMinimumSize(760, 620)
+        self.setMinimumSize(1040, 620)
 
         self.scan_thread = None
         self.scan_worker = None
@@ -256,6 +274,14 @@ class CameraSettingsDialog(QDialog):
         self.camera_list.setMinimumWidth(680)
         self.camera_list.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
         self.scan_status = QLabel("Enter NVR details, then connect to discover streams.")
+        self.analysis_clip_label = QLabel("Clip: none")
+        self.analysis_clip_label.setWordWrap(True)
+        self.analysis_step_label = QLabel("Status: idle")
+        self.analysis_step_label.setWordWrap(True)
+        self.analysis_progress = QProgressBar()
+        self.analysis_progress.setRange(0, 100)
+        self.analysis_progress.setValue(0)
+        self.analysis_current_event = None
         self.scan_button = QPushButton("Connect")
         self.scan_button.clicked.connect(self.scan_cameras)
         self.add_manual_button = QPushButton("Add Manual Channel")
@@ -280,15 +306,29 @@ class CameraSettingsDialog(QDialog):
         form.addRow("", self.browse_video_button)
         form.addRow("", self.test_video_button)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        buttons.rejected.connect(self.reject)
+        left_column = QVBoxLayout()
+        left_column.addLayout(form)
+        left_column.addStretch(1)
 
+        right_column = QVBoxLayout()
+        right_column.addWidget(self.camera_list)
+        right_column.addWidget(self.build_video_analysis_section())
+        right_column.addStretch(1)
+
+        main_layout = QHBoxLayout()
+        main_layout.addLayout(left_column, 2)
+        main_layout.addLayout(right_column, 3)
+        self.setLayout(main_layout)
+
+    def build_video_analysis_section(self):
+        group = QGroupBox("Video Analysis")
+        group.setMinimumWidth(320)
         layout = QVBoxLayout()
-        layout.addLayout(form)
-        layout.addWidget(self.scan_status)
-        layout.addWidget(self.camera_list)
-        layout.addWidget(buttons)
-        self.setLayout(layout)
+        layout.addWidget(self.analysis_clip_label)
+        layout.addWidget(self.analysis_step_label)
+        layout.addWidget(self.analysis_progress)
+        group.setLayout(layout)
+        return group
 
     def reject(self):
         if self.is_scanning():
@@ -619,6 +659,8 @@ class CameraSettingsDialog(QDialog):
 
         thread.started.connect(worker.run)
         worker.frame_ready.connect(self.update_preview)
+        worker.status.connect(self.update_stream_status)
+        worker.analysis.connect(self.update_video_analysis)
         worker.error.connect(self.show_stream_error)
         worker.finished.connect(self.finish_stream)
         worker.finished.connect(thread.quit)
@@ -635,6 +677,44 @@ class CameraSettingsDialog(QDialog):
         self.add_preview_window(stream_id, label)
         self.scan_status.setText(f"Started stream {label}.")
         thread.start()
+
+    def update_stream_status(self, channel, message):
+        status_message = f"{channel}: {message}"
+        self.scan_status.setText(status_message)
+
+    def update_video_analysis(self, channel, clip_name, message, progress):
+        logging.info(
+            "Updating Video Analysis panel channel=%s clip=%s progress=%s message=%s",
+            channel,
+            clip_name,
+            progress,
+            message,
+        )
+        self.analysis_clip_label.setText(f"Clip: {clip_name}")
+        self.analysis_step_label.setText(f"{channel}: {message}")
+        if progress < 0:
+            self.analysis_progress.setRange(0, 0)
+        else:
+            if self.analysis_progress.minimum() != 0 or self.analysis_progress.maximum() != 100:
+                self.analysis_progress.setRange(0, 100)
+            self.analysis_progress.setValue(max(0, min(progress, 100)))
+        self.analysis_current_event = (channel, clip_name, message)
+        if progress >= 100:
+            QTimer.singleShot(
+                3000,
+                lambda event=self.analysis_current_event: self.reset_video_analysis_if_current(event),
+            )
+
+    def reset_video_analysis_if_current(self, event):
+        if self.analysis_current_event != event:
+            return
+
+        self.analysis_current_event = None
+        self.analysis_clip_label.setText("Clip: none")
+        self.analysis_step_label.setText("Status: idle")
+        if self.analysis_progress.minimum() != 0 or self.analysis_progress.maximum() != 100:
+            self.analysis_progress.setRange(0, 100)
+        self.analysis_progress.setValue(0)
 
     def stop_stream(self, channel):
         stream = self.stream_workers.get(channel)

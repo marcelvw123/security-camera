@@ -44,7 +44,7 @@ The installer:
 
 - installs OS packages
 - creates `.venv`
-- installs `requirements.txt`
+- installs `requirements-headless.txt`
 - installs the systemd service and timers
 - enables the 22:00 start timer and 05:00 stop timer
 
@@ -58,23 +58,44 @@ On the Pi:
 
 ```bash
 sudo apt update
-sudo apt install -y python3-venv python3-pip ffmpeg libgl1 libglib2.0-0
+sudo apt install -y \
+  python3-venv \
+  python3-pip \
+  ffmpeg \
+  libgl1 \
+  libglib2.0-0 \
+  python3-opencv \
+  python3-numpy \
+  python3-pil \
+  python3-yaml \
+  python3-requests \
+  python3-scipy \
+  python3-matplotlib \
+  python3-pandas \
+  python3-psutil \
+  python3-tqdm \
+  python3-torch \
+  python3-torchvision
 ```
 
 ### Create Python Environment
 
 ```bash
 cd /home/marcelvw/securitycamera
-python3 -m venv .venv
+python3 -m venv --system-site-packages .venv
 . .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+pip install --no-cache-dir --upgrade pip
+pip install --no-cache-dir --no-deps -r requirements-headless.txt
+pip install --no-cache-dir --no-deps polars ultralytics-thop
 ```
 
-If installing `torch` through `ultralytics` is too slow or fails, install the Raspberry Pi compatible PyTorch build first, then rerun:
+If you previously hit a no-space error, clean partial downloads before retrying:
 
 ```bash
-pip install -r requirements.txt
+rm -rf /home/marcelvw/securitycamera/.venv
+rm -rf ~/.cache/pip
+sudo apt clean
+df -h
 ```
 
 ## 3. First Interactive Setup
@@ -196,6 +217,7 @@ RTSP_READ_TIMEOUT_MS=8000
 RTSP_READ_FAILURES_BEFORE_RECONNECT=20
 RTSP_RECONNECT_DELAY_SECONDS=2
 RECORDING_FPS=20
+DETECT_DURING_RECORDING=false
 ```
 
 Then restart:

@@ -1,3 +1,9 @@
 opencv-python==4.13.0.92
 PySide6-Essentials==6.10.3
 ultralytics==8.4.61
+
+
+file /home/marcelvw/SecurityCamera/debug_frames/ID027_Camera_8_Sub_Stream_person_20260618_220832.jpg
+
+
+scp marcelvw@raspberrypi.local:/home/marcelvw/SecurityCamera/debug_frames/ID027_Camera_8_Sub_Stream_person_20260618_220832.jpg ~/Downloads/
