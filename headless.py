@@ -1,3 +1,4 @@
+import argparse
 import getpass
 import json
 import logging
@@ -18,6 +19,7 @@ from security_camera_core import (
     build_rtsp_url,
     can_open_rtsp_channel,
     run_detection,
+    run_video_clip_detection,
 )
 
 
@@ -25,6 +27,24 @@ LOG_FILE = "security_camera_headless.log"
 DEFAULT_MOTION_SENSITIVITY = 5
 HEADLESS_CONFIG_FILE = Path("headless_config.json")
 LEGACY_HEADLESS_STREAM_CONFIG_FILE = Path("headless_streams.json")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run security camera detection headlessly.")
+    parser.add_argument(
+        "--test-video-clip",
+        metavar="PATH",
+        help="Run the same video clip test/annotation flow as the GUI button, then exit.",
+    )
+    parser.add_argument(
+        "--test-video-sensitivity",
+        type=int,
+        default=DEFAULT_MOTION_SENSITIVITY,
+        choices=range(1, 11),
+        metavar="1-10",
+        help="Motion sensitivity to use with --test-video-clip. Default: 5.",
+    )
+    return parser.parse_args(argv)
 
 
 def configure_logging():
@@ -342,8 +362,44 @@ def save_headless_config(settings, streams, stream_sensitivities):
         logging.warning("Could not save %s: %s", HEADLESS_CONFIG_FILE, exc)
 
 
-def main():
+def run_test_video_clip(video_path, motion_sensitivity):
+    video_path = Path(video_path).expanduser()
+    if not video_path.is_file():
+        logging.error("Video clip not found: %s", video_path)
+        return 1
+
+    stop_event = threading.Event()
+
+    def stop(_signum, _frame):
+        logging.info("Stop requested.")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    logging.info("Testing video clip: %s", video_path)
+    try:
+        run_video_clip_detection(
+            str(video_path),
+            DEFAULT_TARGET_OBJECTS,
+            stop_event.is_set,
+            None,
+            motion_sensitivity,
+        )
+    except Exception:
+        logging.exception("Video clip test failed: %s", video_path)
+        return 1
+
+    logging.info("Video clip test complete: %s", video_path)
+    return 0
+
+
+def main(argv=None):
     configure_logging()
+    args = parse_args(argv)
+
+    if args.test_video_clip:
+        return run_test_video_clip(args.test_video_clip, args.test_video_sensitivity)
 
     saved_config, saved_config_path = load_headless_config()
     settings = settings_from_config(saved_config)
