@@ -566,6 +566,7 @@ def analyze_saved_clip_with_yolo(
                         trigger_id,
                         source_name,
                         scenario_match.name,
+                        frame,
                     )
 
             processed_frames += 1
@@ -846,7 +847,7 @@ def save_trigger_debug_frame(annotated_frame, raw_frame, trigger_id, source_name
         log_trigger_step(trigger_id, "STEP_3_RAW_DEBUG_FRAME_SAVE_FAILED", "image=%s", raw_frame_path)
 
 
-def save_scenario_frame(frame, trigger_id, source_name, scenario_name):
+def save_scenario_frame(frame, trigger_id, source_name, scenario_name, raw_frame=None):
     SCENARIO_FRAME_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_source_name = safe_file_stem(source_name)
@@ -855,10 +856,19 @@ def save_scenario_frame(frame, trigger_id, source_name, scenario_name):
         for character in scenario_name
     ).strip("_")
     scenario_frame_path = SCENARIO_FRAME_DIR / f"{trigger_id}_{safe_source_name}_{safe_scenario_name}_{timestamp}.jpg"
+    raw_scenario_frame_path = SCENARIO_FRAME_DIR / f"raw_{trigger_id}_{safe_source_name}_{safe_scenario_name}_{timestamp}.jpg"
     if cv2.imwrite(str(scenario_frame_path), frame):
         log_trigger_step(trigger_id, "STEP_5_SCENARIO_FRAME_SAVED", "image=%s", scenario_frame_path)
     else:
         log_trigger_step(trigger_id, "STEP_5_SCENARIO_FRAME_SAVE_FAILED", "image=%s", scenario_frame_path)
+
+    if raw_frame is None:
+        return
+
+    if cv2.imwrite(str(raw_scenario_frame_path), raw_frame):
+        log_trigger_step(trigger_id, "STEP_5_RAW_SCENARIO_FRAME_SAVED", "image=%s", raw_scenario_frame_path)
+    else:
+        log_trigger_step(trigger_id, "STEP_5_RAW_SCENARIO_FRAME_SAVE_FAILED", "image=%s", raw_scenario_frame_path)
 
 
 def run_video_clip_detection(video_path, target_objects, stop_requested, frame_callback=noop_frame_callback, motion_sensitivity=None):
@@ -1209,6 +1219,7 @@ def run_detection(
                                 active_trigger_id,
                                 window_title,
                                 active_clip_scenario_match.name,
+                                frame,
                             )
                     if writer is None and pending_trigger_id:
                         if detected_object_names:
@@ -1296,6 +1307,7 @@ def run_detection(
                         active_trigger_id,
                         window_title,
                         active_clip_scenario_match.name,
+                        frame,
                     )
                 status_callback(f"Recording clip: {clip_path.name}")
                 last_recording_progress_second = emit_recording_progress(

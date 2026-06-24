@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import mimetypes
 import os
 import signal
 import sys
@@ -23,6 +24,9 @@ from security_camera_core import (
     DEFAULT_RTSP_PATH_TEMPLATE,
     DEFAULT_RTSP_PORT,
     DEFAULT_TARGET_OBJECTS,
+    DEBUG_FRAME_DIR,
+    OUTPUT_DIR,
+    SCENARIO_FRAME_DIR,
     build_rtsp_url,
     can_open_rtsp_channel,
     run_detection,
@@ -34,6 +38,27 @@ LOG_FILE = "security_camera_web.log"
 DEFAULT_MOTION_SENSITIVITY = 5
 UPLOAD_DIR = Path.home() / "SecurityCamera" / "uploads"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+MEDIA_FOLDERS = {
+    "clips": {
+        "label": "Clips",
+        "path": OUTPUT_DIR,
+        "extensions": VIDEO_EXTENSIONS,
+        "type": "video",
+    },
+    "debug_frames": {
+        "label": "Debug Frames",
+        "path": DEBUG_FRAME_DIR,
+        "extensions": IMAGE_EXTENSIONS,
+        "type": "image",
+    },
+    "scenario_frames": {
+        "label": "Scenario Frames",
+        "path": SCENARIO_FRAME_DIR,
+        "extensions": IMAGE_EXTENSIONS,
+        "type": "image",
+    },
+}
 
 
 @dataclass
@@ -279,6 +304,58 @@ def read_log_tail(max_bytes=60000):
     return data.decode("utf-8", errors="replace")
 
 
+def media_folder_config(folder_key):
+    return MEDIA_FOLDERS.get(folder_key)
+
+
+def list_saved_media(folder_key, limit=80):
+    folder = media_folder_config(folder_key)
+    if folder is None:
+        return []
+
+    folder_path = folder["path"]
+    if not folder_path.is_dir():
+        return []
+
+    items = []
+    for path in folder_path.iterdir():
+        if not path.is_file() or path.suffix.lower() not in folder["extensions"]:
+            continue
+
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+
+        items.append(
+            {
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "url": f"/media/{folder_key}/{path.name}",
+                "type": folder["type"],
+            }
+        )
+
+    items.sort(key=lambda item: item["modified"], reverse=True)
+    return items[:limit]
+
+
+def media_path_for_name(folder_key, filename):
+    folder = media_folder_config(folder_key)
+    if folder is None:
+        return None
+
+    filename = Path(filename).name
+    media_path = (folder["path"] / filename).resolve()
+    media_root = folder["path"].resolve()
+    if media_root not in media_path.parents or not media_path.is_file():
+        return None
+    if media_path.suffix.lower() not in folder["extensions"]:
+        return None
+    return media_path
+
+
 class SecurityCameraWebHandler(BaseHTTPRequestHandler):
     server_version = "SecurityCameraWeb/1.0"
 
@@ -302,6 +379,32 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             return self.send_json({"workers": APP_STATE.worker_summaries()})
         if parsed.path == "/api/logs":
             return self.send_json({"text": read_log_tail()})
+        if parsed.path == "/api/media":
+            query = parse_qs(parsed.query)
+            folder_key = query.get("folder", ["clips"])[0]
+            folder = media_folder_config(folder_key)
+            if folder is None:
+                return self.send_json({"error": "Unknown media folder"}, HTTPStatus.BAD_REQUEST)
+            return self.send_json(
+                {
+                    "folder": folder_key,
+                    "label": folder["label"],
+                    "items": list_saved_media(folder_key),
+                    "folders": [
+                        {"key": key, "label": config["label"], "type": config["type"]}
+                        for key, config in MEDIA_FOLDERS.items()
+                    ],
+                }
+            )
+        if parsed.path == "/api/clips":
+            return self.send_json({"clips": list_saved_media("clips")})
+        if parsed.path.startswith("/media/"):
+            media_path = parsed.path[len("/media/"):]
+            folder_key, _separator, filename = media_path.partition("/")
+            return self.send_media_file(folder_key, unquote(filename))
+        if parsed.path.startswith("/clips/"):
+            filename = unquote(parsed.path[len("/clips/"):])
+            return self.send_media_file("clips", filename)
         if parsed.path.startswith("/preview/"):
             source_id = unquote(parsed.path[len("/preview/"):])
             return self.send_preview(source_id)
@@ -468,6 +571,55 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    def send_media_file(self, folder_key, filename):
+        media_path = media_path_for_name(folder_key, filename)
+        if media_path is None:
+            self.send_error(HTTPStatus.NOT_FOUND, "Media file not found")
+            return
+
+        file_size = media_path.stat().st_size
+        content_type = mimetypes.guess_type(media_path.name)[0] or "application/octet-stream"
+        range_header = self.headers.get("Range", "")
+        start = 0
+        end = file_size - 1
+        status = HTTPStatus.OK
+
+        if range_header.startswith("bytes="):
+            range_value = range_header.split("=", 1)[1].split(",", 1)[0]
+            start_text, _separator, end_text = range_value.partition("-")
+            try:
+                if start_text:
+                    start = int(start_text)
+                if end_text:
+                    end = int(end_text)
+            except ValueError:
+                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                return
+
+            if start < 0 or end >= file_size or start > end:
+                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                return
+            status = HTTPStatus.PARTIAL_CONTENT
+
+        content_length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(content_length))
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.end_headers()
+
+        with media_path.open("rb") as file:
+            file.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = file.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def read_json(self):
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length <= 0:
@@ -629,7 +781,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .stream-list {
       display: grid;
-      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr));
+      gap: 8px;
     }
     .preview-grid {
       display: grid;
@@ -644,23 +797,35 @@ INDEX_HTML = r"""<!doctype html>
     .stream-item, .preview-item {
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 10px;
+      padding: 9px;
       background: #fbfcfd;
     }
     .stream-top {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 76px 74px;
+      grid-template-columns: 1fr;
       gap: 8px;
-      align-items: center;
+    }
+    .stream-controls {
+      display: grid;
+      grid-template-columns: 76px minmax(74px, auto);
+      gap: 8px;
+      align-items: end;
+    }
+    .stream-controls input,
+    .stream-controls button {
+      min-height: 30px;
+      padding-top: 5px;
+      padding-bottom: 5px;
     }
     .stream-title {
       font-weight: 650;
+      font-size: 13px;
       overflow-wrap: anywhere;
     }
     .stream-meta {
-      margin-top: 4px;
+      margin-top: 3px;
       color: var(--muted);
-      font-size: 12px;
+      font-size: 11px;
       overflow-wrap: anywhere;
     }
     .preview-head {
@@ -678,7 +843,7 @@ INDEX_HTML = r"""<!doctype html>
     .preview-item img {
       display: block;
       width: 100%;
-      aspect-ratio: 16 / 9;
+      aspect-ratio: 4 / 3;
       object-fit: contain;
       background: #101820;
       border-radius: 6px;
@@ -688,6 +853,88 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: minmax(0, 1fr) 82px;
       gap: 10px;
       align-items: end;
+    }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .section-head h2 {
+      margin: 0;
+    }
+    .section-head button {
+      min-height: 30px;
+      padding: 5px 9px;
+    }
+    .clip-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+      gap: 10px;
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .clip-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      background: #fbfcfd;
+    }
+    .clip-title {
+      font-weight: 650;
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+    .clip-meta {
+      margin: 4px 0 8px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .clip-item video {
+      display: block;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #101820;
+      border-radius: 6px;
+    }
+    .clip-item img {
+      display: block;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+      background: #101820;
+      border-radius: 6px;
+    }
+    .clip-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .clip-actions a {
+      color: var(--accent-dark);
+      font-size: 12px;
+      font-weight: 650;
+      text-decoration: none;
+    }
+    .media-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 0 0 10px;
+    }
+    .media-tab {
+      min-height: 30px;
+      border-color: var(--line);
+      background: #fff;
+      color: var(--text);
+      padding: 5px 9px;
+    }
+    .media-tab.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
     }
     .logs-section {
       margin: 0 14px 14px;
@@ -806,6 +1053,15 @@ INDEX_HTML = r"""<!doctype html>
         <h2>Previews</h2>
         <div id="previewGrid" class="preview-grid"></div>
       </section>
+
+      <section>
+        <div class="section-head">
+          <h2>Saved Media</h2>
+          <button id="refreshClipsButton" class="secondary">Refresh</button>
+        </div>
+        <div id="mediaTabs" class="media-tabs"></div>
+        <div id="clipList" class="clip-list"></div>
+      </section>
     </div>
   </main>
 
@@ -827,6 +1083,13 @@ INDEX_HTML = r"""<!doctype html>
       streams: [],
       sensitivities: {},
       previews: new Map(),
+      mediaItems: [],
+      mediaFolders: [
+        { key: "clips", label: "Clips", type: "video" },
+        { key: "debug_frames", label: "Debug Frames", type: "image" },
+        { key: "scenario_frames", label: "Scenario Frames", type: "image" }
+      ],
+      activeMediaFolder: "clips",
       defaults: null
     };
 
@@ -910,11 +1173,13 @@ INDEX_HTML = r"""<!doctype html>
         <div class="stream-item">
           <div class="stream-top">
             <div>
-              <div class="stream-title">${escapeHtml(stream.label)}</div>
+              <div class="stream-title">${escapeHtml(compactStreamLabel(stream.label))}</div>
               <div class="stream-meta">${escapeHtml(stream.stream_id)}</div>
             </div>
-            <input id="sensitivity-${index}" data-sensitivity-id="${escapeAttribute(stream.stream_id)}" type="number" min="1" max="10" value="${state.sensitivities[stream.stream_id] || 5}" title="Sensitivity">
-            <button data-start-index="${index}">Start</button>
+            <div class="stream-controls">
+              <input id="sensitivity-${index}" data-sensitivity-id="${escapeAttribute(stream.stream_id)}" type="number" min="1" max="10" value="${state.sensitivities[stream.stream_id] || 5}" title="Sensitivity">
+              <button data-start-index="${index}">Start</button>
+            </div>
           </div>
         </div>
       `).join("");
@@ -947,6 +1212,60 @@ INDEX_HTML = r"""<!doctype html>
           <img src="/preview/${encodeURIComponent(preview.sourceId)}" alt="">
         </div>
       `).join("");
+    }
+
+    function renderMediaTabs() {
+      $("mediaTabs").innerHTML = state.mediaFolders.map((folder) => `
+        <button class="media-tab ${folder.key === state.activeMediaFolder ? "active" : ""}" data-media-folder="${escapeAttribute(folder.key)}">
+          ${escapeHtml(folder.label)}
+        </button>
+      `).join("");
+    }
+
+    function renderMedia() {
+      const list = $("clipList");
+      renderMediaTabs();
+      if (!state.mediaItems.length) {
+        list.innerHTML = `<div class="status">No saved media found.</div>`;
+        return;
+      }
+
+      list.innerHTML = state.mediaItems.map((item) => `
+        <div class="clip-item">
+          <div class="clip-title">${escapeHtml(item.name)}</div>
+          <div class="clip-meta">${escapeHtml(formatDateTime(item.modified))} · ${escapeHtml(formatBytes(item.size))}</div>
+          ${mediaPreviewHtml(item)}
+          <div class="clip-actions">
+            <a href="${escapeAttribute(item.url)}" download>Download</a>
+            <a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer">Open</a>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function mediaPreviewHtml(item) {
+      if (item.type === "image") {
+        return `<a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer"><img src="${escapeAttribute(item.url)}" alt=""></a>`;
+      }
+      return `<video controls preload="metadata" src="${escapeAttribute(item.url)}"></video>`;
+    }
+
+    function compactStreamLabel(label) {
+      return String(label || "").replace(/\s+\([^)]*\{[^)]*\}\)\s*$/, "");
+    }
+
+    function formatBytes(size) {
+      const value = Number(size || 0);
+      if (value < 1024) return `${value} B`;
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+      if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+      return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+    }
+
+    function formatDateTime(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value || "";
+      return date.toLocaleString();
     }
 
     function escapeHtml(value) {
@@ -1128,10 +1447,26 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function loadMedia(folderKey = state.activeMediaFolder) {
+      state.activeMediaFolder = folderKey;
+      try {
+        const response = await fetch(`/api/media?folder=${encodeURIComponent(state.activeMediaFolder)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || response.statusText);
+        state.mediaFolders = data.folders || state.mediaFolders;
+        state.mediaItems = data.items || [];
+        renderMedia();
+      } catch (_error) {
+        renderMediaTabs();
+        $("clipList").innerHTML = `<div class="status">Could not load saved media.</div>`;
+      }
+    }
+
     $("scanButton").addEventListener("click", scanStreams);
     $("manualButton").addEventListener("click", addManualChannel);
     $("uploadButton").addEventListener("click", uploadVideo);
     $("refreshLogsButton").addEventListener("click", loadLogs);
+    $("refreshClipsButton").addEventListener("click", () => loadMedia());
     document.addEventListener("input", (event) => {
       if (event.target.matches("input")) {
         const streamId = event.target.dataset.sensitivityId;
@@ -1145,14 +1480,18 @@ INDEX_HTML = r"""<!doctype html>
     document.addEventListener("click", (event) => {
       const startIndex = event.target.dataset.startIndex;
       const stopId = event.target.dataset.stopId;
+      const mediaFolder = event.target.dataset.mediaFolder;
       if (startIndex !== undefined) startStream(Number(startIndex));
       if (stopId !== undefined) stopSource(decodeURIComponent(stopId));
+      if (mediaFolder !== undefined) loadMedia(mediaFolder);
     });
 
     loadDefaults();
     loadLogs();
+    loadMedia();
     setInterval(pollWorkers, 3000);
     setInterval(loadLogs, 3000);
+    setInterval(() => loadMedia(), 15000);
   </script>
 </body>
 </html>

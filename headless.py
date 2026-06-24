@@ -34,7 +34,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--test-video-clip",
         metavar="PATH",
-        help="Run the same video clip test/annotation flow as the GUI button, then exit.",
+        help="Run the video clip test/annotation flow, then exit.",
     )
     parser.add_argument(
         "--test-video-sensitivity",
