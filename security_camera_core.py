@@ -18,7 +18,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_cache_dir))
 
 import cv2
 from app_config import load_dotenv
-from cloud_upload import upload_clip_async
+from cloud_upload import upload_clip_async, upload_file_async
 from gemma_analysis import analyze_clip_with_gemma
 from scenario_detector import SCENARIO_OBJECTS, ScenarioDetector, ScenarioMatch, scenario_relevant_objects
 from video_compat import make_whatsapp_compatible_mp4
@@ -98,6 +98,8 @@ DEFAULT_RECORDING_FPS = int_env("RECORDING_FPS", 20, min_value=1, max_value=60)
 DETECT_DURING_RECORDING = bool_env("DETECT_DURING_RECORDING", False)
 DETECTION_INTERVAL_SECONDS = float_env("DETECTION_INTERVAL_SECONDS", 1.0, min_value=0.0)
 RECORDING_READ_RETRY_SLEEP_SECONDS = float_env("RECORDING_READ_RETRY_SLEEP_SECONDS", 0.05, min_value=0.0)
+DEBUG_FRAMES_CONTAINER = os.getenv("DEBUG_FRAMES_CONTAINER", "debugframes").strip() or "debugframes"
+SCENARIO_FRAMES_CONTAINER = os.getenv("SCENARIO_FRAMES_CONTAINER", "scenarioframes").strip() or "scenarioframes"
 PREVIEW_EVERY_N_FRAMES = 3
 JPEG_PREVIEW_QUALITY = 70
 _TRIGGER_COUNTER = count(1)
@@ -751,6 +753,9 @@ def target_class_ids(model, target_objects):
 def emit_preview_frame(frame, frame_callback):
     if frame_callback is None:
         return
+    should_emit = getattr(frame_callback, "should_emit", None)
+    if should_emit is not None and not should_emit():
+        return
 
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_PREVIEW_QUALITY]
     encoded, buffer = cv2.imencode(".jpg", frame, encode_params)
@@ -838,13 +843,58 @@ def save_trigger_debug_frame(annotated_frame, raw_frame, trigger_id, source_name
 
     if cv2.imwrite(str(annotated_frame_path), annotated_frame):
         log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVED", "image=%s", annotated_frame_path)
+        upload_frame_async(
+            annotated_frame_path,
+            DEBUG_FRAMES_CONTAINER,
+            "debug_frame",
+            trigger_id,
+            source_name,
+            objects=objects,
+            frame_variant="annotated",
+        )
     else:
         log_trigger_step(trigger_id, "STEP_3_DEBUG_FRAME_SAVE_FAILED", "image=%s", annotated_frame_path)
 
     if cv2.imwrite(str(raw_frame_path), raw_frame):
         log_trigger_step(trigger_id, "STEP_3_RAW_DEBUG_FRAME_SAVED", "image=%s", raw_frame_path)
+        upload_frame_async(
+            raw_frame_path,
+            DEBUG_FRAMES_CONTAINER,
+            "debug_frame",
+            trigger_id,
+            source_name,
+            objects=objects,
+            frame_variant="raw",
+        )
     else:
         log_trigger_step(trigger_id, "STEP_3_RAW_DEBUG_FRAME_SAVE_FAILED", "image=%s", raw_frame_path)
+
+
+def upload_frame_async(
+    frame_path,
+    container,
+    frame_type,
+    trigger_id,
+    source_name,
+    objects=None,
+    scenario_name=None,
+    frame_variant=None,
+):
+    metadata = {
+        "camera": source_name,
+        "source_name": source_name,
+        "frame_type": frame_type,
+        "trigger_id": trigger_id,
+    }
+    if objects:
+        metadata["detected_objects"] = sorted(objects)
+        metadata["detected"] = sorted(objects)
+    if scenario_name:
+        metadata["scenario"] = scenario_name
+    if frame_variant:
+        metadata["frame_variant"] = frame_variant
+
+    upload_file_async(str(frame_path), metadata, container=container)
 
 
 def save_scenario_frame(frame, trigger_id, source_name, scenario_name, raw_frame=None):
@@ -859,6 +909,15 @@ def save_scenario_frame(frame, trigger_id, source_name, scenario_name, raw_frame
     raw_scenario_frame_path = SCENARIO_FRAME_DIR / f"raw_{trigger_id}_{safe_source_name}_{safe_scenario_name}_{timestamp}.jpg"
     if cv2.imwrite(str(scenario_frame_path), frame):
         log_trigger_step(trigger_id, "STEP_5_SCENARIO_FRAME_SAVED", "image=%s", scenario_frame_path)
+        upload_frame_async(
+            scenario_frame_path,
+            SCENARIO_FRAMES_CONTAINER,
+            "scenario_frame",
+            trigger_id,
+            source_name,
+            scenario_name=scenario_name,
+            frame_variant="annotated",
+        )
     else:
         log_trigger_step(trigger_id, "STEP_5_SCENARIO_FRAME_SAVE_FAILED", "image=%s", scenario_frame_path)
 
@@ -867,6 +926,15 @@ def save_scenario_frame(frame, trigger_id, source_name, scenario_name, raw_frame
 
     if cv2.imwrite(str(raw_scenario_frame_path), raw_frame):
         log_trigger_step(trigger_id, "STEP_5_RAW_SCENARIO_FRAME_SAVED", "image=%s", raw_scenario_frame_path)
+        upload_frame_async(
+            raw_scenario_frame_path,
+            SCENARIO_FRAMES_CONTAINER,
+            "scenario_frame",
+            trigger_id,
+            source_name,
+            scenario_name=scenario_name,
+            frame_variant="raw",
+        )
     else:
         log_trigger_step(trigger_id, "STEP_5_RAW_SCENARIO_FRAME_SAVE_FAILED", "image=%s", raw_scenario_frame_path)
 

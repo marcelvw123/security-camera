@@ -69,6 +69,7 @@ class WorkerState:
     thread: threading.Thread
     kind: str
     status: str = "starting"
+    preview_enabled: bool = True
     analysis: dict = field(default_factory=dict)
     frame: bytes | None = None
     frame_version: int = 0
@@ -104,6 +105,7 @@ class WebAppState:
                     "label": worker.label,
                     "kind": worker.kind,
                     "status": worker.status,
+                    "preview_enabled": worker.preview_enabled,
                     "analysis": worker.analysis,
                     "started_at": worker.started_at,
                 }
@@ -217,6 +219,14 @@ def update_analysis(worker, clip_name, message, progress):
     }
 
 
+def preview_frame_callback(worker):
+    def callback(frame_bytes):
+        update_frame(worker, frame_bytes)
+
+    callback.should_emit = lambda: worker.preview_enabled
+    return callback
+
+
 def run_camera_worker(worker, stream, settings, target_objects, sensitivity):
     try:
         if stream.rtsp_url:
@@ -240,7 +250,7 @@ def run_camera_worker(worker, stream, settings, target_objects, sensitivity):
             worker.label,
             target_objects,
             worker.stop_event.is_set,
-            lambda frame: update_frame(worker, frame),
+            preview_frame_callback(worker),
             sensitivity,
             lambda message: update_status(worker, message),
             lambda clip_name, message, progress: update_analysis(worker, clip_name, message, progress),
@@ -262,7 +272,7 @@ def run_video_worker(worker, video_path, target_objects, sensitivity):
             str(video_path),
             target_objects,
             worker.stop_event.is_set,
-            lambda frame: update_frame(worker, frame),
+            preview_frame_callback(worker),
             sensitivity,
         )
         worker.status = "complete"
@@ -360,7 +370,7 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
     server_version = "SecurityCameraWeb/1.0"
 
     def log_message(self, fmt, *args):
-        logging.info("%s - %s", self.address_string(), fmt % args)
+        return
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -418,6 +428,8 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             return self.handle_stream_start()
         if parsed.path == "/api/stream/stop":
             return self.handle_stream_stop()
+        if parsed.path == "/api/preview/set":
+            return self.handle_preview_set()
         if parsed.path == "/api/video/start":
             return self.handle_video_start(parsed)
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -481,6 +493,23 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         with worker.condition:
             worker.condition.notify_all()
         self.send_json({"stopped": True})
+
+    def handle_preview_set(self):
+        payload = self.read_json()
+        source_id = str(payload.get("source_id", "")).strip()
+        enabled = bool(payload.get("enabled"))
+        worker = APP_STATE.get_worker(source_id)
+        if worker is None:
+            return self.send_json({"error": "Worker is not running"}, HTTPStatus.NOT_FOUND)
+
+        worker.preview_enabled = enabled
+        if not enabled:
+            with worker.condition:
+                worker.frame = None
+                worker.frame_version += 1
+                worker.condition.notify_all()
+        logging.info("Preview %s for %s", "enabled" if enabled else "disabled", worker.label)
+        self.send_json({"source_id": source_id, "preview_enabled": worker.preview_enabled})
 
     def handle_video_start(self, parsed):
         query = parse_qs(parsed.query)
@@ -848,6 +877,20 @@ INDEX_HTML = r"""<!doctype html>
       background: #101820;
       border-radius: 6px;
     }
+    .preview-placeholder {
+      display: grid;
+      place-items: center;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      border: 1px solid #1f2933;
+      border-radius: 6px;
+      background: #101820;
+      color: #d9e2ec;
+      font-size: 12px;
+      font-weight: 650;
+      text-align: center;
+      padding: 12px;
+    }
     .video-controls {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 82px;
@@ -906,6 +949,18 @@ INDEX_HTML = r"""<!doctype html>
       object-fit: contain;
       background: #101820;
       border-radius: 6px;
+    }
+    .video-placeholder {
+      display: grid;
+      place-items: center;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border: 1px solid #1f2933;
+      border-radius: 6px;
+      background: #101820;
+      color: #d9e2ec;
+      font-size: 12px;
+      font-weight: 650;
     }
     .clip-actions {
       display: flex;
@@ -1185,9 +1240,14 @@ INDEX_HTML = r"""<!doctype html>
       `).join("");
     }
 
-    function addPreview(sourceId, label) {
-      if (state.previews.has(sourceId)) return;
-      state.previews.set(sourceId, { sourceId, label });
+    function addPreview(sourceId, label, previewEnabled = true) {
+      const existing = state.previews.get(sourceId);
+      if (existing) {
+        existing.label = label;
+        existing.previewEnabled = previewEnabled;
+      } else {
+        state.previews.set(sourceId, { sourceId, label, previewEnabled });
+      }
       renderPreviews();
     }
 
@@ -1207,9 +1267,16 @@ INDEX_HTML = r"""<!doctype html>
         <div class="preview-item">
           <div class="preview-head">
             <div class="preview-title">${escapeHtml(preview.label)}</div>
-            <button class="danger" data-stop-id="${encodeURIComponent(preview.sourceId)}">Stop</button>
+            <div class="actions">
+              <button class="secondary" data-preview-id="${encodeURIComponent(preview.sourceId)}" data-preview-enabled="${preview.previewEnabled ? "0" : "1"}">
+                ${preview.previewEnabled ? "Hide Preview" : "Show Preview"}
+              </button>
+              <button class="danger" data-stop-id="${encodeURIComponent(preview.sourceId)}">Stop</button>
+            </div>
           </div>
-          <img src="/preview/${encodeURIComponent(preview.sourceId)}" alt="">
+          ${preview.previewEnabled
+            ? `<img src="/preview/${encodeURIComponent(preview.sourceId)}" alt="">`
+            : `<div class="preview-placeholder">Preview disabled<br>Detection is still running.</div>`}
         </div>
       `).join("");
     }
@@ -1245,9 +1312,9 @@ INDEX_HTML = r"""<!doctype html>
 
     function mediaPreviewHtml(item) {
       if (item.type === "image") {
-        return `<a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer"><img src="${escapeAttribute(item.url)}" alt=""></a>`;
+        return `<a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer"><img src="${escapeAttribute(item.url)}" loading="lazy" alt=""></a>`;
       }
-      return `<video controls preload="metadata" src="${escapeAttribute(item.url)}"></video>`;
+      return `<a class="video-placeholder" href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer">Open Video</a>`;
     }
 
     function compactStreamLabel(label) {
@@ -1380,6 +1447,26 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("Stopping");
     }
 
+    async function setPreviewEnabled(sourceId, enabled) {
+      const preview = state.previews.get(sourceId);
+      if (preview) {
+        preview.previewEnabled = enabled;
+        renderPreviews();
+      }
+
+      try {
+        const data = await jsonFetch("/api/preview/set", { source_id: sourceId, enabled });
+        const updatedPreview = state.previews.get(sourceId);
+        if (updatedPreview) {
+          updatedPreview.previewEnabled = data.preview_enabled;
+          renderPreviews();
+        }
+      } catch (error) {
+        $("scanStatus").textContent = error.message;
+        setStatus("Error");
+      }
+    }
+
     async function uploadVideo() {
       const file = $("videoFile").files[0];
       if (!file) {
@@ -1417,7 +1504,7 @@ INDEX_HTML = r"""<!doctype html>
         const data = await response.json();
         const activeIds = new Set(data.workers.map((worker) => worker.source_id));
         for (const worker of data.workers) {
-          addPreview(worker.source_id, worker.label);
+          addPreview(worker.source_id, worker.label, worker.preview_enabled);
         }
         for (const sourceId of Array.from(state.previews.keys())) {
           if (!activeIds.has(sourceId)) state.previews.delete(sourceId);
@@ -1480,9 +1567,12 @@ INDEX_HTML = r"""<!doctype html>
     document.addEventListener("click", (event) => {
       const startIndex = event.target.dataset.startIndex;
       const stopId = event.target.dataset.stopId;
+      const previewId = event.target.dataset.previewId;
+      const previewEnabled = event.target.dataset.previewEnabled;
       const mediaFolder = event.target.dataset.mediaFolder;
       if (startIndex !== undefined) startStream(Number(startIndex));
       if (stopId !== undefined) stopSource(decodeURIComponent(stopId));
+      if (previewId !== undefined) setPreviewEnabled(decodeURIComponent(previewId), previewEnabled === "1");
       if (mediaFolder !== undefined) loadMedia(mediaFolder);
     });
 
@@ -1491,7 +1581,6 @@ INDEX_HTML = r"""<!doctype html>
     loadMedia();
     setInterval(pollWorkers, 3000);
     setInterval(loadLogs, 3000);
-    setInterval(() => loadMedia(), 15000);
   </script>
 </body>
 </html>

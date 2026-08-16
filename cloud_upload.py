@@ -41,38 +41,48 @@ class CloudUploadConfig:
         )
 
 
-def upload_clip_async(clip_path: str, metadata: Dict[str, Any]) -> None:
-    logging.info("Cloud upload queued for clip: %s", clip_path)
+def upload_file_async(file_path: str, metadata: Dict[str, Any], container: Optional[str] = None) -> None:
+    logging.info("Cloud upload queued for file: %s", file_path)
     thread = threading.Thread(
-        target=upload_clip,
-        args=(clip_path, metadata),
+        target=upload_file,
+        args=(file_path, metadata, container),
         daemon=True,
     )
     thread.start()
 
 
-def upload_clip(clip_path: str, metadata: Dict[str, Any], config: Optional[CloudUploadConfig] = None) -> bool:
-    logging.info("Cloud upload started for clip: %s", clip_path)
+def upload_clip_async(clip_path: str, metadata: Dict[str, Any]) -> None:
+    upload_file_async(clip_path, metadata)
+
+
+def upload_file(
+    file_path: str,
+    metadata: Dict[str, Any],
+    container: Optional[str] = None,
+    config: Optional[CloudUploadConfig] = None,
+) -> bool:
+    logging.info("Cloud upload started for file: %s", file_path)
     config = config or CloudUploadConfig.from_environment()
     if config is None:
         logging.info("Cloud upload skipped because API environment config is missing")
         return False
 
-    clip_file = Path(clip_path)
-    if not clip_file.is_file():
-        logging.warning("Cloud upload skipped because clip file does not exist: %s", clip_file)
+    upload_file_path = Path(file_path)
+    if not upload_file_path.is_file():
+        logging.warning("Cloud upload skipped because file does not exist: %s", upload_file_path)
         return False
 
-    content_type = mimetypes.guess_type(clip_file.name)[0] or "video/mp4"
-    upload_request = build_upload_url_request(config, clip_file, content_type, metadata)
+    content_type = mimetypes.guess_type(upload_file_path.name)[0] or "application/octet-stream"
+    upload_request = build_upload_url_request(config, upload_file_path, content_type, metadata, container=container)
     logging.info(
-        "Requesting cloud upload URL for clip %s from %s",
-        clip_file.name,
+        "Requesting cloud upload URL for file %s from %s%s",
+        upload_file_path.name,
         config.api_base_url,
+        f" container={container}" if container else "",
     )
     upload_details = post_json(config, UPLOAD_URL_ENDPOINT, upload_request)
     if not upload_details:
-        logging.warning("Cloud upload aborted because upload URL request failed for clip: %s", clip_file)
+        logging.warning("Cloud upload aborted because upload URL request failed for file: %s", upload_file_path)
         return False
 
     upload_url = upload_details.get("upload_url") or upload_details.get("uploadUrl")
@@ -80,33 +90,41 @@ def upload_clip(clip_path: str, metadata: Dict[str, Any], config: Optional[Cloud
         logging.warning("Cloud upload failed because /clips/upload-url did not return upload_url")
         return False
 
-    if not upload_to_blob(upload_url, clip_file, content_type):
-        logging.warning("Cloud upload aborted because blob upload failed for clip: %s", clip_file)
+    if not upload_to_blob(upload_url, upload_file_path, content_type):
+        logging.warning("Cloud upload aborted because blob upload failed for file: %s", upload_file_path)
         return False
 
     clip_id = upload_details.get("clip_id") or upload_details.get("clipId")
     if clip_id:
         logging.info("Reporting cloud upload completion for clip_id=%s", clip_id)
-        complete_clip_upload(config, str(clip_id), clip_file, upload_details)
+        complete_clip_upload(config, str(clip_id), upload_file_path, upload_details)
 
-    logging.info("Cloud upload completed for clip: %s", clip_file)
+    logging.info("Cloud upload completed for file: %s", upload_file_path)
     return True
+
+
+def upload_clip(clip_path: str, metadata: Dict[str, Any], config: Optional[CloudUploadConfig] = None) -> bool:
+    return upload_file(clip_path, metadata, config=config)
 
 
 def build_upload_url_request(
     config: CloudUploadConfig,
-    clip_file: Path,
+    upload_file_path: Path,
     content_type: str,
     metadata: Dict[str, Any],
+    container: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload = {
         "device_id": config.device_id,
-        "filename": clip_file.name,
+        "filename": upload_file_path.name,
         "content_type": content_type,
-        "size_bytes": clip_file.stat().st_size,
+        "size_bytes": upload_file_path.stat().st_size,
         "created_at": datetime.now(timezone.utc).isoformat(),
         **metadata,
     }
+    if container:
+        payload["container"] = container
+    return payload
 
 
 def post_json(config: CloudUploadConfig, endpoint: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
