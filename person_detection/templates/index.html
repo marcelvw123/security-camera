@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Night Person Detector</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="card">
+    <div class="eyebrow">LOCAL VIDEO ANALYSIS</div>
+    <h1>Find people in difficult CCTV footage</h1>
+    <p class="lede">Upload a video to receive an annotated copy and precise bounding-box coordinates. Processing stays on this computer.</p>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form action="/detect" method="post" enctype="multipart/form-data" onsubmit="document.querySelector('button').disabled=true; document.querySelector('button').textContent='Detecting people…'; document.querySelector('.wait').hidden=false">
+      <label class="drop">
+        <span>Select a CCTV video</span>
+        <input type="file" name="video" accept="video/mp4,video/quicktime,video/x-m4v,video/x-msvideo" required>
+      </label>
+      <button type="submit">Detect people</button>
+      <p class="wait" hidden>This can take several times the video duration because each frame is inspected at multiple scales.</p>
+    </form>
+  </main>
+</body>
+</html>
+

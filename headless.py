@@ -1,3 +1,7 @@
+from runtime_warnings import configure_runtime_warnings
+
+configure_runtime_warnings()
+
 import argparse
 import getpass
 import json

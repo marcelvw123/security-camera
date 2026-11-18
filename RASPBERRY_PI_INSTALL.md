@@ -72,6 +72,7 @@ sudo apt install -y \
   python3-scipy \
   python3-matplotlib \
   python3-pandas \
+  python3-seaborn \
   python3-psutil \
   python3-tqdm \
   python3-torch \
@@ -218,6 +219,26 @@ RTSP_READ_FAILURES_BEFORE_RECONNECT=20
 RTSP_RECONNECT_DELAY_SECONDS=2
 RECORDING_FPS=20
 DETECT_DURING_RECORDING=false
+```
+
+To test an LLVIP YOLOv5 pedestrian model, copy the `.pt` file into the project, for example:
+
+```bash
+cd /home/marcelvw/securitycamera
+mkdir -p /home/marcelvw/securitycamera/models
+cp /path/to/llvip_yolov5_infrared.pt /home/marcelvw/securitycamera/models/llvip_yolov5_infrared.pt
+mkdir -p /home/marcelvw/securitycamera/vendor
+git clone --depth 1 https://github.com/bupt-ai-cz/LLVIP.git /home/marcelvw/securitycamera/vendor/LLVIP
+python3 scripts/patch_llvip_yolov5.py
+```
+
+Then add:
+
+```env
+YOLO_MODEL_FILENAME=models/llvip_yolov5_infrared.pt
+YOLO_IMAGE_SIZE=1280
+YOLO_CONFIDENCE=0.55
+YOLO_CLASS_ALIASES=pedestrian=person,human=person,people=person,pedestrians=person
 ```
 
 Then restart:

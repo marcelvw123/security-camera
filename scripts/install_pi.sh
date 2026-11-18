@@ -33,6 +33,7 @@ sudo apt install -y \
   python3-scipy \
   python3-matplotlib \
   python3-pandas \
+  python3-seaborn \
   python3-psutil \
   python3-tqdm \
   python3-torch \

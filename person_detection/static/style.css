@@ -1,0 +1,24 @@
+:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #08110e; color: #f5f7f4; }
+* { box-sizing: border-box; }
+body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 28px; background: radial-gradient(circle at 25% 10%, #183b2d, transparent 38%), #08110e; }
+.card { width: min(680px, 100%); padding: clamp(28px, 6vw, 58px); border: 1px solid #345547; border-radius: 24px; background: rgba(12, 25, 20, .94); box-shadow: 0 30px 90px #0008; }
+.wide { width: min(920px, 100%); }
+.eyebrow { color: #70e4a2; font-size: .78rem; letter-spacing: .16em; font-weight: 750; }
+h1 { font-size: clamp(2rem, 6vw, 3.6rem); line-height: 1.02; margin: 14px 0 18px; letter-spacing: -.045em; }
+.lede, .wait { color: #aec0b7; line-height: 1.6; }
+.drop { margin: 34px 0 18px; min-height: 150px; border: 1px dashed #63977d; border-radius: 16px; display: grid; place-items: center; padding: 24px; color: #d7e8df; background: #13271f; cursor: pointer; }
+.drop input { width: 100%; margin-top: 14px; }
+button, .button { display: inline-block; width: 100%; border: 0; border-radius: 12px; padding: 15px 22px; background: #63e598; color: #07100c; font: inherit; font-weight: 800; text-align: center; text-decoration: none; cursor: pointer; }
+button:disabled { opacity: .65; }
+.error { background: #441f22; color: #ffdadd; padding: 13px 16px; border-radius: 10px; }
+video { width: 100%; max-height: 62vh; margin: 18px 0; border-radius: 14px; background: #000; }
+.stats { display: flex; gap: 24px; color: #a8bcb1; margin-bottom: 20px; }
+.stats strong { color: #fff; }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.secondary { border: 1px solid #50715f; border-radius: 12px; padding: 14px; color: #dcf4e6; text-decoration: none; text-align: center; }
+.again { display: block; margin-top: 24px; color: #8edcaf; }
+.progress { height: 14px; margin-top: 34px; overflow: hidden; border-radius: 999px; background: #20362c; }
+.progress div { width: 0; height: 100%; border-radius: inherit; background: #63e598; transition: width .35s ease; }
+.progress-label { color: #9fb2a8; }
+.progress-label strong { color: #fff; margin-right: 8px; }
+@media (max-width: 620px) { .actions { grid-template-columns: 1fr; } }

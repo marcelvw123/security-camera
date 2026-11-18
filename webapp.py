@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from runtime_warnings import configure_runtime_warnings
+
+configure_runtime_warnings()
+
 import argparse
 import json
 import logging
@@ -27,6 +31,8 @@ from security_camera_core import (
     DEBUG_FRAME_DIR,
     OUTPUT_DIR,
     SCENARIO_FRAME_DIR,
+    YOLO_MODEL_FILENAME,
+    UPLOAD_ON_MOTION,
     build_rtsp_url,
     can_open_rtsp_channel,
     run_detection,
@@ -69,6 +75,8 @@ class WorkerState:
     thread: threading.Thread
     kind: str
     status: str = "starting"
+    model_filename: str = ""
+    upload_on_motion: bool = False
     preview_enabled: bool = True
     analysis: dict = field(default_factory=dict)
     frame: bytes | None = None
@@ -105,7 +113,9 @@ class WebAppState:
                     "label": worker.label,
                     "kind": worker.kind,
                     "status": worker.status,
+                    "model_filename": worker.model_filename,
                     "preview_enabled": worker.preview_enabled,
+                    "upload_on_motion": worker.upload_on_motion,
                     "analysis": worker.analysis,
                     "started_at": worker.started_at,
                 }
@@ -149,6 +159,65 @@ def default_settings():
             default=DEFAULT_RTSP_PATH_TEMPLATE,
         ),
     }
+
+
+def model_label(model_filename):
+    stem = Path(model_filename).stem.replace("_", " ").replace("-", " ")
+    labels = {
+        "llvip": "LLVIP",
+        "yolov5": "YOLOv5",
+        "yolov8": "YOLOv8",
+        "yolo11": "YOLO11",
+    }
+    words = []
+    for word in stem.split():
+        lower_word = word.lower()
+        for prefix, label in labels.items():
+            if lower_word.startswith(prefix):
+                words.append(f"{label}{word[len(prefix):]}")
+                break
+        else:
+            words.append(word.capitalize())
+    return " ".join(words)
+
+
+def available_yolo_models():
+    models = {}
+
+    def add_model(model_filename):
+        model_filename = str(model_filename).strip()
+        if not model_filename:
+            return
+        model_path = Path(model_filename).expanduser()
+        if model_path.is_absolute():
+            exists = model_path.is_file()
+            value = str(model_path)
+        else:
+            exists = (Path(__file__).resolve().parent / model_path).is_file()
+            value = model_filename
+        if exists:
+            models[value] = {"filename": value, "label": model_label(value)}
+
+    add_model(YOLO_MODEL_FILENAME)
+    models_dir = Path(__file__).resolve().parent / "models"
+    if models_dir.is_dir():
+        for path in sorted(models_dir.glob("*.pt")):
+            add_model(Path("models") / path.name)
+
+    if not models:
+        models[YOLO_MODEL_FILENAME] = {"filename": YOLO_MODEL_FILENAME, "label": model_label(YOLO_MODEL_FILENAME)}
+
+    return list(models.values())
+
+
+def selected_model_filename(raw_model_filename):
+    raw_model_filename = str(raw_model_filename or "").strip()
+    valid_models = {model["filename"] for model in available_yolo_models()}
+    if not raw_model_filename:
+        return YOLO_MODEL_FILENAME
+    if raw_model_filename not in valid_models:
+        raise ValueError("Unknown YOLO model selected.")
+    return raw_model_filename
 
 
 def optional_text(value):
@@ -227,7 +296,7 @@ def preview_frame_callback(worker):
     return callback
 
 
-def run_camera_worker(worker, stream, settings, target_objects, sensitivity):
+def run_camera_worker(worker, stream, settings, target_objects, sensitivity, model_filename):
     try:
         if stream.rtsp_url:
             stream_url = stream.rtsp_url
@@ -254,6 +323,8 @@ def run_camera_worker(worker, stream, settings, target_objects, sensitivity):
             sensitivity,
             lambda message: update_status(worker, message),
             lambda clip_name, message, progress: update_analysis(worker, clip_name, message, progress),
+            model_filename,
+            upload_on_motion=worker.upload_on_motion,
         )
     except Exception as exc:
         logging.exception("Browser stream failed: %s", worker.label)
@@ -265,7 +336,7 @@ def run_camera_worker(worker, stream, settings, target_objects, sensitivity):
         APP_STATE.remove_worker(worker.source_id)
 
 
-def run_video_worker(worker, video_path, target_objects, sensitivity):
+def run_video_worker(worker, video_path, target_objects, sensitivity, model_filename):
     try:
         worker.status = "running"
         run_video_clip_detection(
@@ -274,6 +345,7 @@ def run_video_worker(worker, video_path, target_objects, sensitivity):
             worker.stop_event.is_set,
             preview_frame_callback(worker),
             sensitivity,
+            model_filename,
         )
         worker.status = "complete"
     except Exception as exc:
@@ -383,6 +455,9 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
                     "available_target_objects": list(AVAILABLE_TARGET_OBJECTS),
                     "default_target_objects": list(DEFAULT_TARGET_OBJECTS),
                     "default_motion_sensitivity": DEFAULT_MOTION_SENSITIVITY,
+                    "default_upload_on_motion": UPLOAD_ON_MOTION,
+                    "available_yolo_models": available_yolo_models(),
+                    "default_yolo_model": YOLO_MODEL_FILENAME,
                 }
             )
         if parsed.path == "/api/workers":
@@ -457,7 +532,16 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         if not target_objects:
             return self.send_json({"error": "Select at least one object to detect."}, HTTPStatus.BAD_REQUEST)
 
+        upload_on_motion = payload.get("upload_on_motion", UPLOAD_ON_MOTION)
+        if not isinstance(upload_on_motion, bool):
+            return self.send_json({"error": "upload_on_motion must be a boolean."}, HTTPStatus.BAD_REQUEST)
+
         sensitivity = parse_sensitivity(payload.get("sensitivity"))
+        try:
+            model_filename = selected_model_filename(payload.get("model_filename"))
+        except ValueError as exc:
+            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
         stop_event = threading.Event()
         worker = WorkerState(
             source_id=stream.stream_id,
@@ -465,10 +549,12 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             stop_event=stop_event,
             thread=None,
             kind="camera",
+            upload_on_motion=upload_on_motion,
+            model_filename=model_filename,
         )
         thread = threading.Thread(
             target=run_camera_worker,
-            args=(worker, stream, settings, target_objects, sensitivity),
+            args=(worker, stream, settings, target_objects, sensitivity, model_filename),
             daemon=True,
         )
         worker.thread = thread
@@ -542,6 +628,11 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         if not targets:
             targets = set(DEFAULT_TARGET_OBJECTS)
         sensitivity = parse_sensitivity(query.get("sensitivity", [DEFAULT_MOTION_SENSITIVITY])[0])
+        try:
+            model_filename = selected_model_filename(query.get("model", [""])[0])
+        except ValueError as exc:
+            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
         source_id = f"clip:{video_path.name}"
         stop_event = threading.Event()
         worker = WorkerState(
@@ -550,10 +641,11 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             stop_event=stop_event,
             thread=None,
             kind="video",
+            model_filename=model_filename,
         )
         thread = threading.Thread(
             target=run_video_worker,
-            args=(worker, video_path, targets, sensitivity),
+            args=(worker, video_path, targets, sensitivity, model_filename),
             daemon=True,
         )
         worker.thread = thread
@@ -1071,6 +1163,8 @@ INDEX_HTML = r"""<!doctype html>
         <input id="rtspTemplate">
         <label>Record Objects</label>
         <div id="targetObjects" class="checks"></div>
+        <label for="modelSelect">Detector Model</label>
+        <select id="modelSelect"></select>
         <div class="actions">
           <button id="scanButton">Connect</button>
           <button id="manualButton" class="secondary">Add Manual Channel</button>
@@ -1137,6 +1231,7 @@ INDEX_HTML = r"""<!doctype html>
     const state = {
       streams: [],
       sensitivities: {},
+      motionUploads: {},
       previews: new Map(),
       mediaItems: [],
       mediaFolders: [
@@ -1168,6 +1263,8 @@ INDEX_HTML = r"""<!doctype html>
         target_objects: targetObjects(),
         streams: state.streams,
         sensitivities: state.sensitivities,
+        motion_uploads: state.motionUploads,
+        model_filename: modelFilename(),
         video_sensitivity: $("videoSensitivity").value || "5"
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
@@ -1204,12 +1301,25 @@ INDEX_HTML = r"""<!doctype html>
       return Array.from(document.querySelectorAll("[data-target-object]:checked")).map((box) => box.value);
     }
 
+    function modelFilename() {
+      return $("modelSelect").value || (state.defaults && state.defaults.default_yolo_model) || "";
+    }
+
     function renderTargetObjects(objects, defaults) {
       $("targetObjects").innerHTML = objects.map((objectName) => `
         <label>
           <input type="checkbox" value="${objectName}" data-target-object ${defaults.includes(objectName) ? "checked" : ""}>
           ${titleCase(objectName)}
         </label>
+      `).join("");
+    }
+
+    function renderModelOptions(models, selectedModel) {
+      const options = Array.isArray(models) ? models : [];
+      $("modelSelect").innerHTML = options.map((model) => `
+        <option value="${escapeAttribute(model.filename)}" ${model.filename === selectedModel ? "selected" : ""}>
+          ${escapeHtml(model.label || model.filename)}
+        </option>
       `).join("");
     }
 
@@ -1233,6 +1343,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div class="stream-controls">
               <input id="sensitivity-${index}" data-sensitivity-id="${escapeAttribute(stream.stream_id)}" type="number" min="1" max="10" value="${state.sensitivities[stream.stream_id] || 5}" title="Sensitivity">
+              <label title="Motion-only capture: upload to motion/ without object detection, scenario or Gemma analysis. Applies when starting the camera."><input id="motion-upload-${index}" data-motion-upload-id="${escapeAttribute(stream.stream_id)}" type="checkbox" ${(state.motionUploads[stream.stream_id] ?? state.defaults?.default_upload_on_motion ?? false) ? "checked" : ""}> Upload clips on motion</label>
               <button data-start-index="${index}">Start</button>
             </div>
           </div>
@@ -1370,8 +1481,10 @@ INDEX_HTML = r"""<!doctype html>
       $("videoSensitivity").value = saved.video_sensitivity || defaults.default_motion_sensitivity || 5;
       renderTargetObjects(defaults.available_target_objects, defaults.default_target_objects);
       applySavedTargets(saved.target_objects);
+      renderModelOptions(defaults.available_yolo_models, saved.model_filename || defaults.default_yolo_model);
       if (Array.isArray(saved.streams)) state.streams = saved.streams;
       state.sensitivities = saved.sensitivities || {};
+      state.motionUploads = saved.motion_uploads || {};
       renderStreams();
       renderPreviews();
       await pollWorkers();
@@ -1425,13 +1538,16 @@ INDEX_HTML = r"""<!doctype html>
       const stream = state.streams[index];
       const sensitivity = Number($(`sensitivity-${index}`).value || 5);
       state.sensitivities[stream.stream_id] = sensitivity;
+      state.motionUploads[stream.stream_id] = $(`motion-upload-${index}`).checked;
       saveState();
       try {
         const data = await jsonFetch("/api/stream/start", {
           settings: settings(),
           stream,
           target_objects: targetObjects(),
-          sensitivity
+          sensitivity,
+          upload_on_motion: state.motionUploads[stream.stream_id],
+          model_filename: modelFilename()
         });
         addPreview(data.worker.source_id, data.worker.label);
         setStatus("Running");
@@ -1479,6 +1595,7 @@ INDEX_HTML = r"""<!doctype html>
         const params = new URLSearchParams();
         params.set("filename", file.name);
         params.set("sensitivity", $("videoSensitivity").value || "5");
+        params.set("model", modelFilename());
         for (const target of targetObjects()) params.append("targets", target);
         const response = await fetch(`/api/video/start?${params.toString()}`, {
           method: "POST",
@@ -1562,7 +1679,9 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
     document.addEventListener("change", (event) => {
-      if (event.target.matches("input")) saveState();
+      const motionStreamId = event.target.dataset.motionUploadId;
+      if (motionStreamId) state.motionUploads[motionStreamId] = event.target.checked;
+      if (event.target.matches("input, select")) saveState();
     });
     document.addEventListener("click", (event) => {
       const startIndex = event.target.dataset.startIndex;

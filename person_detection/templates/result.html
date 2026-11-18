@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Detection complete</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="card wide">
+    <div class="eyebrow">DETECTION COMPLETE</div>
+    <h1>Your annotated video is ready</h1>
+    <video controls playsinline src="/jobs/{{ job_id }}/people_detected.mp4"></video>
+    <div class="stats">
+      <span><strong>{{ summary.frames }}</strong> frames</span>
+      <span><strong>{{ summary.unique_tracks }}</strong> candidate tracks</span>
+    </div>
+    <div class="actions">
+      <a class="button" href="/jobs/{{ job_id }}/people_detected.mp4">Download annotated MP4</a>
+      <a class="secondary" href="/jobs/{{ job_id }}/bounding_boxes.json">Download bounding boxes</a>
+    </div>
+    <a class="again" href="/">Analyse another video</a>
+  </main>
+</body>
+</html>
+

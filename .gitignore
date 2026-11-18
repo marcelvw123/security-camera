@@ -29,9 +29,12 @@ clips/
 *.mov
 
 # Model weights and large artifacts
+models/
+vendor/LLVIP/
 *.pt
 *.onnx
 *.engine
+*.rar
 
 # PyInstaller
 build/

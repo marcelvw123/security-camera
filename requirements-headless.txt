@@ -1,1 +1,2 @@
 ultralytics==8.4.61
+urllib3<2

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Detecting people</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="card">
+    <div class="eyebrow">ANALYSING VIDEO</div>
+    <h1>Looking for people…</h1>
+    <p class="lede" id="message">Loading the model and preparing your video.</p>
+    <div class="progress"><div id="bar"></div></div>
+    <p class="progress-label"><strong id="percent">0%</strong> <span id="frames"></span></p>
+    <div class="error" id="error" hidden></div>
+  </main>
+  <script>
+    const jobId = {{ job_id|tojson }};
+    async function checkProgress() {
+      try {
+        const response = await fetch(`/api/jobs/${jobId}`, {cache: 'no-store'});
+        const job = await response.json();
+        if (job.status === 'complete') {
+          window.location.replace(`/result/${jobId}`);
+          return;
+        }
+        if (job.status === 'failed') {
+          document.getElementById('message').textContent = 'Detection stopped.';
+          const error = document.getElementById('error');
+          error.textContent = job.error || 'Unknown processing error';
+          error.hidden = false;
+          return;
+        }
+        const percent = job.percent || 0;
+        document.getElementById('bar').style.width = `${percent}%`;
+        document.getElementById('percent').textContent = `${percent}%`;
+        document.getElementById('message').textContent = job.total ? 'Inspecting the video frame by frame.' : 'Loading the detection model…';
+        document.getElementById('frames').textContent = job.total ? `${job.frame} of ${job.total} frames` : '';
+      } catch (error) {
+        document.getElementById('message').textContent = 'The server is still working; reconnecting…';
+      }
+      setTimeout(checkProgress, 1000);
+    }
+    checkProgress();
+  </script>
+</body>
+</html>
