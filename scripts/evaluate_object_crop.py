@@ -14,10 +14,11 @@ p.add_argument('--crop', nargs=4, type=float, metavar=('X', 'Y', 'W', 'H'), requ
                help='normalized crop coordinates')
 p.add_argument('--interval', type=float, default=1)
 p.add_argument('--confidence', type=float, default=.1)
+p.add_argument('--imgsz', type=int, default=640)
 p.add_argument('--output', type=Path, required=True)
 a = p.parse_args()
 x, y, w, h = a.crop
-if not all(math.isfinite(v) for v in a.crop) or x < 0 or y < 0 or w <= 0 or h <= 0 or x+w > 1 or y+h > 1 or a.interval <= 0 or not 0 < a.confidence < 1:
+if not all(math.isfinite(v) for v in a.crop) or x < 0 or y < 0 or w <= 0 or h <= 0 or x+w > 1 or y+h > 1 or a.interval <= 0 or not 0 < a.confidence < 1 or not 32 <= a.imgsz <= 2048:
     p.error('invalid crop, interval, or confidence')
 cap = cv2.VideoCapture(str(a.video))
 if not cap.isOpened(): p.error('cannot open video')
@@ -36,7 +37,7 @@ try:
         height, width = frame.shape[:2]
         x1, y1, x2, y2 = int(x*width), int(y*height), math.ceil((x+w)*width), math.ceil((y+h)*height)
         pred = model.predict(frame[y1:y2, x1:x2], classes=[2, 3, 5, 7], conf=a.confidence,
-                             imgsz=640, device='cpu', verbose=False)[0]
+                             imgsz=a.imgsz, device='cpu', verbose=False)[0]
         boxes = [{'label': model.names[int(cls)], 'confidence': round(float(conf), 3),
                   'box': [round(float(box[0])+x1, 1), round(float(box[1])+y1, 1),
                           round(float(box[2])+x1, 1), round(float(box[3])+y1, 1)]}
@@ -45,5 +46,5 @@ try:
 finally:
     cap.release()
 a.output.write_text(json.dumps({'video': a.video.name, 'crop': a.crop, 'interval': a.interval,
-                                'confidence': a.confidence, 'samples': results}, indent=2) + '\n')
+                                'confidence': a.confidence, 'imgsz': a.imgsz, 'samples': results}, indent=2) + '\n')
 print(f"{sum(bool(s['boxes']) for s in results)}/{len(results)} sampled frames have vehicle detections")

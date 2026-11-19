@@ -15,6 +15,7 @@ from urllib.parse import quote
 from motion_difference import FrameDifferenceMotion
 from motion_preroll import AsyncPreRollWriter, MotionPreRoll
 from motion_shadow import MotionShadowComparison
+from motion_clip_metadata import start_metadata, update_metadata, finish_metadata, load_metadata
 from runtime_warnings import configure_runtime_warnings
 
 configure_runtime_warnings()
@@ -701,13 +702,18 @@ def finalize_recorded_clip(
 
     log_trigger_step(
         trigger_id,
-        "STEP_6_CLIP_SAVED",
+        "MOTION_CLIP_SAVED" if upload_on_motion else "STEP_6_CLIP_SAVED",
         "clip=%s%s",
         clip_path,
         f" reason={reason}" if reason else "",
     )
     recorded_clip_path = Path(clip_path)
     if upload_on_motion:
+        finish_metadata(recorded_clip_path)
+        metadata = load_metadata(recorded_clip_path)
+        if bool_env('WHATSAPP_OBJECT_ALERTS_ENABLED', False) and metadata and metadata.get('objects'):
+            from object_alerts import queue_object_alert
+            queue_object_alert(recorded_clip_path, source_name, metadata['objects'])
         # Motion-only mode keeps raw recordings local for independent review.
         status_callback(f"Motion clip saved: {recorded_clip_path.name}")
         analysis_callback(recorded_clip_path.name, "Motion clip saved locally", 100)
@@ -1155,6 +1161,7 @@ def run_detection(
     object_detector=None,
     object_status_callback=None,
     object_source_id=None,
+    object_result_callback=None,
 ):
     # This branch deliberately runs motion capture only, regardless of legacy settings.
     upload_on_motion = True
@@ -1163,7 +1170,7 @@ def run_detection(
     algorithm = motion_algorithm or MOTION_ALGORITHM
     if algorithm not in ('background', 'difference'):
         raise ValueError('unknown motion algorithm')
-    difference = FrameDifferenceMotion(pixel_threshold=15,
+    difference = FrameDifferenceMotion(pixel_threshold=20 if sensitivity_config.level == 1 else 15,
         min_area=max(1, int(200 * 5 / sensitivity_config.level)), exclusions=excluded_areas) if algorithm == 'difference' else None
     model = None
     motion_detector = cv2.createBackgroundSubtractorMOG2(
@@ -1184,6 +1191,7 @@ def run_detection(
     active_trigger_id = None
     pending_trigger_id = None
     clip_start_time = 0.0
+    clip_detection_start = 0.0
     clip_end_time = 0.0
     next_clip_frame_time = 0.0
     next_detection_time = 0.0
@@ -1398,7 +1406,7 @@ def run_detection(
                         pending_trigger_id = new_trigger_id()
                         log_trigger_step(
                             pending_trigger_id,
-                            "STEP_1_MOTION_DETECTED",
+                            "MOTION_DETECTED",
                             "camera=%s motion_boxes=%s",
                             window_title,
                             len(motion_boxes),
@@ -1462,7 +1470,8 @@ def run_detection(
             # Never delete user footage to make room. Stop creating new clips at the
             # configured cap or reserve, while leaving preview and detection running.
             if writer is None and motion_detected:
-                clip_count = sum(1 for path in OUTPUT_DIR.glob("motion_*") if path.is_file())
+                clip_count = sum(1 for path in OUTPUT_DIR.glob("motion_*")
+                                 if path.is_file() and path.suffix.lower() in ('.mp4', '.mov', '.avi', '.mkv', '.m4v'))
                 enough_space = shutil.disk_usage(OUTPUT_DIR).free >= MOTION_MIN_FREE_MB * 1024 * 1024
                 if clip_count >= MOTION_MAX_CLIPS or not enough_space:
                     if loop_now >= storage_warning_at:
@@ -1475,12 +1484,9 @@ def run_detection(
             if writer is None and (matched_objects or (upload_on_motion and motion_detected)):
                 if pending_trigger_id is None:
                     pending_trigger_id = new_trigger_id()
-                log_trigger_step(
-                    pending_trigger_id,
-                    "STEP_3_MOTION_UPLOAD_TRIGGERED" if upload_on_motion and motion_detected else "STEP_3_TARGET_OBJECTS_DETECTED",
-                    "objects=%s",
-                    sorted(matched_objects),
-                )
+                if not upload_on_motion:
+                    log_trigger_step(pending_trigger_id, "STEP_3_TARGET_OBJECTS_DETECTED",
+                                     "objects=%s", sorted(matched_objects))
                 if not upload_on_motion:
                     save_trigger_debug_frame(
                         annotated_frame,
@@ -1498,6 +1504,8 @@ def run_detection(
                 writer = AsyncPreRollWriter(raw_writer, preroll, loop_now, fps)
                 clip_path = writer.path
                 active_clip_path = clip_path
+                if upload_on_motion:
+                    start_metadata(clip_path)
                 active_clip_objects = set(relevant_objects)
                 active_clip_scenario_detector = None if upload_on_motion else ScenarioDetector(window_seconds=CLIP_SECONDS, cooldown_seconds=0)
                 active_clip_scenario_match = None
@@ -1508,6 +1516,7 @@ def run_detection(
                     )
                 active_trigger_id = pending_trigger_id
                 pending_trigger_id = None
+                clip_detection_start = loop_now
                 clip_start_time = time.monotonic()
                 clip_end_time = clip_start_time + CLIP_SECONDS
                 next_recording_space_check = clip_start_time + 5.0
@@ -1517,8 +1526,8 @@ def run_detection(
                 last_recording_raw_frame = frame.copy()
                 log_trigger_step(
                     active_trigger_id,
-                    "STEP_4_CLIP_RECORDING_STARTED",
-                    "camera=%s clip=%s seconds=%s detect_during_recording=%s",
+                    "MOTION_CLIP_RECORDING_STARTED" if upload_on_motion else "STEP_4_CLIP_RECORDING_STARTED",
+                    "camera=%s clip=%s minimum_seconds=%s detect_during_recording=%s",
                     window_title,
                     clip_path,
                     CLIP_SECONDS,
@@ -1559,7 +1568,15 @@ def run_detection(
 
             if object_recorder is not None:
                 try:
-                    object_recorder.observe(frame, loop_now, bool(writer is not None or motion_detected))
+                    checks = object_recorder.observe(frame, loop_now, bool(writer is not None or motion_detected))
+                    if object_result_callback:
+                        for _sampled_at, labels, _evidence in checks:
+                            if labels:
+                                object_result_callback(labels)
+                    if active_clip_path is not None and upload_on_motion:
+                        for sampled_at, labels, evidence in checks:
+                            if sampled_at >= clip_detection_start:
+                                update_metadata(active_clip_path, labels, evidence)
                 except Exception:
                     logging.exception('Object clip processing failed for %s', window_title)
                     try:

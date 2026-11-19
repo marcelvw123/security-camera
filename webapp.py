@@ -25,6 +25,8 @@ from app_config import load_dotenv
 from camera_discovery import DiscoveredStream, discover_nvr_streams
 from network_guess import likely_dvr_ip
 from motion_difference import FrameDifferenceMotion
+from object_detection import LocalVehicleVerifier
+from motion_clip_metadata import load_metadata, title_for_metadata
 from security_camera_core import (
     DEFAULT_RTSP_PATH_TEMPLATE,
     DEFAULT_RTSP_PORT,
@@ -40,6 +42,38 @@ LOG_FILE = "security_camera_web.log"
 DEFAULT_MOTION_SENSITIVITY = 5
 EXCLUSIONS_FILE = Path(__file__).resolve().parent / "motion_exclusions.json"
 EXCLUSIONS_LOCK = threading.RLock()
+VEHICLE_AREAS_FILE = Path(__file__).resolve().parent / "vehicle_detection_areas.json"
+VEHICLE_AREAS_LOCK = threading.RLock()
+
+
+def load_vehicle_areas():
+    with VEHICLE_AREAS_LOCK:
+        if not VEHICLE_AREAS_FILE.exists():
+            return {}
+        data = json.loads(VEHICLE_AREAS_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError('Invalid vehicle area settings')
+        for crop in data.values():
+            FrameDifferenceMotion.validate_exclusions([crop])
+        return data
+
+
+def save_vehicle_area(source_id, crop):
+    FrameDifferenceMotion.validate_exclusions([crop])
+    with VEHICLE_AREAS_LOCK:
+        data = load_vehicle_areas()
+        data[source_id] = crop
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', dir=VEHICLE_AREAS_FILE.parent, prefix='.vehicle_areas_', delete=False) as out:
+                temporary = out.name
+                json.dump(data, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, VEHICLE_AREAS_FILE)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def load_exclusion_map():
@@ -87,6 +121,12 @@ MEDIA_FOLDERS = {
         "extensions": VIDEO_EXTENSIONS,
         "type": "video",
     },
+    "detection_frames": {
+        "label": "Detection images",
+        "path": OBJECT_OUTPUT_DIR / 'detection_frames',
+        "extensions": IMAGE_EXTENSIONS,
+        "type": "image",
+    },
 }
 
 OBJECT_DETECTOR = None
@@ -106,21 +146,41 @@ class WorkerState:
     status: str = "starting"
     object_recording: bool = False
     object_error: bool = False
+    detected_objects: tuple = ()
+    detected_at: float = 0.0
     preview_enabled: bool = True
     frame: bytes | None = None
     frame_version: int = 0
     condition: threading.Condition = field(default_factory=threading.Condition)
     started_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     excluded_areas: list = field(default_factory=list)
+    vehicle_area: list = field(default_factory=list)
     exclusions_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def current_exclusions(self):
         with self.exclusions_lock:
             return [list(area) for area in self.excluded_areas]
 
+    def recent_objects(self):
+        with self.condition:
+            return list(self.detected_objects) if time.monotonic() - self.detected_at < 8 else []
+
+    def record_objects(self, labels):
+        with self.condition:
+            self.detected_objects = tuple(sorted({label for label in labels if isinstance(label, str) and label}))
+            self.detected_at = time.monotonic()
+
     def set_exclusions(self, areas):
         with self.exclusions_lock:
             self.excluded_areas = [list(area) for area in areas]
+
+    def current_vehicle_area(self):
+        with self.exclusions_lock:
+            return list(self.vehicle_area)
+
+    def set_vehicle_area(self, area):
+        with self.exclusions_lock:
+            self.vehicle_area = list(area)
 
 
 class WebAppState:
@@ -154,10 +214,14 @@ class WebAppState:
                     "status": worker.status,
                     "recording": worker.status.startswith("Recording clip:"),
                     "object_recording": worker.object_recording,
+                    "object_processing": bool(OBJECT_DETECTOR and OBJECT_DETECTOR.is_processing(worker.source_id)),
+                    "detected_objects": worker.recent_objects(),
                     "object_detection_status": 'error' if worker.object_error else (OBJECT_DETECTOR.status if OBJECT_DETECTOR else 'disabled'),
+                    "vehicle_verifier_status": getattr(OBJECT_DETECTOR.remote_shadow, 'status', 'remote') if OBJECT_DETECTOR and OBJECT_DETECTOR.remote_shadow else 'disabled',
                     "preview_enabled": worker.preview_enabled,
                     "started_at": worker.started_at,
                     "excluded_areas": worker.current_exclusions(),
+                    "vehicle_area": worker.current_vehicle_area(),
                 }
                 for worker in self.workers.values()
             ]
@@ -300,6 +364,7 @@ def run_camera_worker(worker, stream, settings, sensitivity, excluded_areas=None
             object_detector=OBJECT_DETECTOR,
             object_status_callback=lambda value: update_object_status(worker, value),
             object_source_id=worker.source_id,
+            object_result_callback=worker.record_objects,
         )
     except Exception as exc:
         logging.exception("Browser stream failed: %s", worker.label)
@@ -348,9 +413,16 @@ def list_saved_media(folder_key, limit=80):
         except OSError:
             continue
 
+        metadata = load_metadata(path) if folder_key in ('clips', 'object_clips') else None
+        evidence = []
+        for name in (metadata or {}).get('evidence', []):
+            if isinstance(name, str) and Path(name).name == name and (OBJECT_OUTPUT_DIR / 'detection_frames' / name).is_file():
+                evidence.append({'name': name, 'url': f'/media/detection_frames/{name}'})
         items.append(
             {
                 "name": path.name,
+                "detection_title": title_for_metadata(metadata) if folder_key == 'clips' else None,
+                "evidence": evidence,
                 "size": stat.st_size,
                 "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
                 "url": f"/media/{folder_key}/{path.name}",
@@ -439,6 +511,8 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             return self.handle_stream_stop()
         if parsed.path == "/api/stream/exclusions":
             return self.handle_stream_exclusions()
+        if parsed.path == "/api/stream/vehicle-area":
+            return self.handle_stream_vehicle_area()
         if parsed.path == "/api/preview/set":
             return self.handle_preview_set()
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -471,6 +545,7 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             if exclusions is None:
                 exclusions = load_exclusion_map().get(stream.stream_id, [])
             FrameDifferenceMotion.validate_exclusions(exclusions)
+            vehicle_area = load_vehicle_areas().get(stream.stream_id, LocalVehicleVerifier.default_crop(stream.stream_id))
         except (ValueError, OSError) as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
@@ -483,6 +558,7 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             kind="camera",
             sensitivity=sensitivity,
             excluded_areas=exclusions,
+            vehicle_area=vehicle_area,
         )
         thread = threading.Thread(
             target=run_camera_worker,
@@ -496,6 +572,8 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
 
+        if OBJECT_DETECTOR and isinstance(OBJECT_DETECTOR.remote_shadow, LocalVehicleVerifier):
+            OBJECT_DETECTOR.remote_shadow.set_crop(worker.source_id, vehicle_area)
         thread.start()
         self.send_json({"worker": {"source_id": worker.source_id, "label": worker.label}})
 
@@ -514,6 +592,26 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             logging.warning("Could not save motion exclusions: %s", type(exc).__name__)
             return self.send_json({"error": "Could not save exclusion areas; check the rectangles and storage."}, HTTPStatus.BAD_REQUEST)
         self.send_json({"source_id": source_id, "excluded_areas": worker.current_exclusions()})
+
+    def handle_stream_vehicle_area(self):
+        payload = self.read_json()
+        source_id = str(payload.get('source_id', '')).strip()
+        area = payload.get('vehicle_area')
+        worker = APP_STATE.get_worker(source_id)
+        if worker is None:
+            return self.send_json({'error': 'Camera is not running.'}, HTTPStatus.NOT_FOUND)
+        if OBJECT_DETECTOR and OBJECT_DETECTOR.remote_shadow and not isinstance(OBJECT_DETECTOR.remote_shadow, LocalVehicleVerifier):
+            return self.send_json({'error': 'Custom vehicle areas require the Pi-only verifier.'}, HTTPStatus.CONFLICT)
+        try:
+            FrameDifferenceMotion.validate_exclusions([area])
+            save_vehicle_area(source_id, area)
+            if OBJECT_DETECTOR and isinstance(OBJECT_DETECTOR.remote_shadow, LocalVehicleVerifier):
+                OBJECT_DETECTOR.remote_shadow.set_crop(source_id, area)
+            worker.set_vehicle_area(area)
+        except (ValueError, OSError):
+            logging.exception('Could not save vehicle area')
+            return self.send_json({'error': 'Could not save vehicle area; check the rectangle and storage.'}, HTTPStatus.BAD_REQUEST)
+        self.send_json({'source_id': source_id, 'vehicle_area': worker.current_vehicle_area()})
 
     def handle_stream_stop(self):
         payload = self.read_json()
@@ -797,9 +895,11 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
       gap: 10px;
     }
-    .recording-indicator { display: inline-flex; align-items: center; gap: 6px; margin: 5px 0; font-size: 12px; font-weight: 700; color: #52606d; }
-    .recording-indicator.active { color: #b42318; }
-    .recording-indicator.active::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: #d92d20; }
+    .preview-statuses { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 8px; }
+    .preview-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 22px; padding: 2px 7px; border: 1px solid #dce4e9; border-radius: 5px; background: #f2f6f8; color: #52606d; font-size: 11px; line-height: 1.25; font-weight: 600; }
+    .recording-indicator.active { border-color: #f3b9b3; background: #fff1ef; color: #b42318; }
+    .recording-indicator.active::before { content: ""; width: 7px; height: 7px; flex: none; border-radius: 50%; background: #d92d20; }
+    .detection-indicator.active { border-color: #a6ddc2; background: #eaf8f0; color: #17643b; }
     @media (min-width: 1320px) {
       .preview-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -843,14 +943,18 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
-      margin-bottom: 8px;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      margin-bottom: 6px;
     }
     .preview-title {
       min-width: 0;
       font-weight: 650;
+      font-size: 13px;
       overflow-wrap: anywhere;
     }
+    .preview-actions { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; }
+    .preview-actions button { min-height: 27px; padding: 4px 7px; font-size: 11px; line-height: 1.2; }
     .preview-item img {
       display: block;
       width: 100%;
@@ -1091,10 +1195,10 @@ INDEX_HTML = r"""<!doctype html>
   </main>
   <dialog id="zoneDialog" class="zone-dialog" aria-labelledby="zoneTitle">
     <h2 id="zoneTitle">Draw excluded areas</h2>
-    <p class="zone-help">Drag on the image to add rectangles. All motion inside a shaded area is ignored, including people and vehicles.</p>
+    <p id="zoneHelp" class="zone-help">Drag on the image to add rectangles. All motion inside a shaded area is ignored, including people and vehicles.</p>
     <div class="zone-stage"><img id="zoneImage" alt="Live camera view"><canvas id="zoneCanvas" width="1000" height="1000" aria-label="Draw exclusion rectangles on the live camera image"></canvas></div>
     <div id="zoneStatus" class="status" role="status"></div>
-    <div class="actions"><button id="zoneUndo" type="button" class="secondary">Undo last</button><button id="zoneClear" type="button" class="secondary">Clear all</button><button id="zoneCancel" type="button" class="secondary">Cancel</button><button id="zoneSave" type="button">Save areas</button></div>
+    <div class="actions"><button id="zoneUndo" type="button" class="secondary">Undo</button><button id="zoneRemove" type="button" class="secondary">Remove selected</button><button id="zoneClear" type="button" class="secondary">Clear all</button><button id="zoneCancel" type="button" class="secondary">Cancel</button><button id="zoneSave" type="button">Save areas</button></div>
   </dialog>
 
   <section class="logs-section">
@@ -1194,7 +1298,7 @@ INDEX_HTML = r"""<!doctype html>
       `).join("");
     }
 
-    function addPreview(sourceId, label, previewEnabled = true, excludedAreas = [], recording = false, status = "", objectRecording = false, objectStatus = "disabled", sensitivity = null) {
+    function addPreview(sourceId, label, previewEnabled = true, excludedAreas = [], recording = false, status = "", objectRecording = false, objectStatus = "disabled", sensitivity = null, vehicleArea = [0,0,1,1], objectProcessing = false, detectedObjects = []) {
       const existing = state.previews.get(sourceId);
       if (existing) {
         existing.label = label;
@@ -1205,8 +1309,11 @@ INDEX_HTML = r"""<!doctype html>
         existing.objectRecording = objectRecording;
         existing.objectStatus = objectStatus;
         existing.sensitivity = sensitivity;
+        existing.vehicleArea = vehicleArea;
+        existing.objectProcessing = objectProcessing;
+        existing.detectedObjects = detectedObjects;
       } else {
-        state.previews.set(sourceId, { sourceId, label, previewEnabled, excludedAreas, recording, status, objectRecording, objectStatus, sensitivity });
+        state.previews.set(sourceId, { sourceId, label, previewEnabled, excludedAreas, recording, status, objectRecording, objectStatus, sensitivity, vehicleArea, objectProcessing, detectedObjects });
       }
       renderPreviews();
     }
@@ -1227,17 +1334,21 @@ INDEX_HTML = r"""<!doctype html>
         <div class="preview-item">
           <div class="preview-head">
             <div class="preview-title">${escapeHtml(preview.label)}</div>
-            <div class="actions">
+            <div class="preview-actions">
               <button class="secondary" data-preview-id="${encodeURIComponent(preview.sourceId)}" data-preview-enabled="${preview.previewEnabled ? "0" : "1"}">
                 ${preview.previewEnabled ? "Hide Preview" : "Show Preview"}
               </button>
-              ${preview.previewEnabled ? `<button class="secondary" data-zone-id="${encodeURIComponent(preview.sourceId)}">Draw excluded areas</button>` : ""}
+              ${preview.previewEnabled ? `<button class="secondary" data-zone-id="${encodeURIComponent(preview.sourceId)}">Excluded areas</button>` : ""}
+              ${preview.previewEnabled ? `<button class="secondary" data-vehicle-zone-id="${encodeURIComponent(preview.sourceId)}">Vehicle area</button>` : ""}
               <button class="danger" data-stop-id="${encodeURIComponent(preview.sourceId)}">Stop</button>
             </div>
           </div>
-          <div class="recording-indicator ${preview.recording ? "active" : ""}" role="status">${preview.recording ? "Recording motion" : (preview.status && preview.status.toLowerCase().includes("paused") ? escapeHtml(preview.status) : "Not recording")}</div>
-          <div class="stream-meta">Motion sensitivity: ${preview.sensitivity == null ? "starting" : `${escapeHtml(String(preview.sensitivity))} / 10`}</div>
-          <div class="recording-indicator ${preview.objectRecording ? "active" : ""}" role="status">${preview.objectRecording ? "Recording object" : (preview.objectStatus === "ready" ? "Object recording idle" : `Object detection: ${escapeHtml(preview.objectStatus)}`)}</div>
+          <div class="preview-statuses">
+            <span class="preview-badge recording-indicator ${preview.recording ? "active" : ""}" role="status">${preview.recording ? "Motion: recording" : (preview.status && preview.status.toLowerCase().includes("paused") ? escapeHtml(preview.status) : "Motion: idle")}</span>
+            <span class="preview-badge">Sensitivity ${preview.sensitivity == null ? "starting" : `${escapeHtml(String(preview.sensitivity))}/10`}</span>
+            <span class="preview-badge recording-indicator ${preview.objectRecording ? "active" : ""}" role="status">${preview.objectRecording ? "Object: recording" : (preview.objectStatus === "ready" ? "Object: idle" : `Object detection: ${escapeHtml(preview.objectStatus)}`)}</span>
+            <span class="preview-badge detection-indicator ${preview.detectedObjects.length ? "active" : ""}" role="status">${preview.detectedObjects.length ? `Detected: ${escapeHtml(preview.detectedObjects.join(", "))}` : (preview.objectProcessing ? "Objects: checking" : "Objects: none recent")}</span>
+          </div>
           ${preview.previewEnabled
             ? `<img src="/preview/${encodeURIComponent(preview.sourceId)}" alt="">`
             : `<div class="preview-placeholder">Preview disabled<br>Detection is still running.</div>`}
@@ -1263,13 +1374,14 @@ INDEX_HTML = r"""<!doctype html>
 
       list.innerHTML = state.mediaItems.map((item) => `
         <div class="clip-item">
-          <div class="clip-title">${escapeHtml(item.name)}</div>
+          <div class="clip-title">${escapeHtml(item.name)}${item.detection_title ? ` — ${escapeHtml(item.detection_title)}` : ''}</div>
           <div class="clip-meta">${escapeHtml(formatDateTime(item.modified))} · ${escapeHtml(formatBytes(item.size))}</div>
           ${mediaPreviewHtml(item)}
           <div class="clip-actions">
             <a href="${escapeAttribute(item.url)}" download>Download</a>
             <a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer">Open</a>
           </div>
+          ${(item.evidence || []).length ? `<div class="clip-actions">${item.evidence.map((frame, index) => `<a href="${escapeAttribute(frame.url)}" target="_blank" rel="noreferrer">Detection image ${index + 1}</a>`).join('')}</div>` : ''}
         </div>
       `).join("");
     }
@@ -1409,6 +1521,50 @@ INDEX_HTML = r"""<!doctype html>
     let zoneAreas = [];
     let zoneStart = null;
     let zoneCurrent = null;
+    let zoneMode = 'exclusions';
+    let zoneSelected = -1;
+    let zoneAction = null;
+    let zoneHistory = [];
+
+    function zoneSnapshot() { return zoneAreas.map((area) => [...area]); }
+    function zoneRemember() { zoneHistory.push(zoneSnapshot()); if (zoneHistory.length > 30) zoneHistory.shift(); }
+    const zoneClamp = (value, low, high) => Math.max(low, Math.min(high, value));
+    function zoneHandles(area) {
+      const [x,y,w,h] = area;
+      return [['nw',x,y],['n',x+w/2,y],['ne',x+w,y],['e',x+w,y+h/2],
+              ['se',x+w,y+h],['s',x+w/2,y+h],['sw',x,y+h],['w',x,y+h/2]];
+    }
+    function zoneHit(point) {
+      const canvas = $('zoneCanvas'), rect = canvas.getBoundingClientRect();
+      if (zoneSelected >= 0 && zoneAreas[zoneSelected]) {
+        for (const [name,x,y] of zoneHandles(zoneAreas[zoneSelected])) {
+          if (Math.abs(point[0]-x)*rect.width <= 10 && Math.abs(point[1]-y)*rect.height <= 10)
+            return {type:'resize', index:zoneSelected, handle:name};
+        }
+      }
+      for (let i=zoneAreas.length-1; i>=0; i--) {
+        const [x,y,w,h] = zoneAreas[i];
+        if (point[0]>=x && point[0]<=x+w && point[1]>=y && point[1]<=y+h) return {type:'move', index:i};
+      }
+      return {type:'draw'};
+    }
+
+    function applyZoneAction(point) {
+      if (!zoneAction || zoneAction.type === 'draw') return;
+      const a = zoneAction, [x,y,w,h] = a.original;
+      if (a.type === 'move') {
+        const nx = zoneClamp(x + point[0] - a.start[0], 0, 1-w);
+        const ny = zoneClamp(y + point[1] - a.start[1], 0, 1-h);
+        zoneAreas[a.index] = [nx, ny, Math.min(w,1-nx), Math.min(h,1-ny)];
+      } else {
+        let left=x, top=y, right=x+w, bottom=y+h;
+        if (a.handle.includes('w')) left=zoneClamp(point[0], 0, right-.005);
+        if (a.handle.includes('e')) right=zoneClamp(point[0], left+.005, 1);
+        if (a.handle.includes('n')) top=zoneClamp(point[1], 0, bottom-.005);
+        if (a.handle.includes('s')) bottom=zoneClamp(point[1], top+.005, 1);
+        zoneAreas[a.index] = [left, top, Math.min(right-left,1-left), Math.min(bottom-top,1-top)];
+      }
+    }
 
     function zonePoint(event) {
       const bounds = $("zoneCanvas").getBoundingClientRect();
@@ -1428,21 +1584,33 @@ INDEX_HTML = r"""<!doctype html>
         ctx.strokeRect(x*canvas.width, y*canvas.height, w*canvas.width, h*canvas.height);
       };
       zoneAreas.forEach((area) => draw(area));
+      if (zoneSelected >= 0 && zoneAreas[zoneSelected]) {
+        ctx.fillStyle = '#fff'; ctx.strokeStyle = '#b42318'; ctx.lineWidth = 3;
+        for (const [,x,y] of zoneHandles(zoneAreas[zoneSelected])) {
+          const px=x*canvas.width, py=y*canvas.height;
+          ctx.fillRect(px-8,py-8,16,16); ctx.strokeRect(px-8,py-8,16,16);
+        }
+      }
       if (zoneStart && zoneCurrent) draw(zoneRectangle(zoneStart, zoneCurrent), true);
-      $("zoneStatus").textContent = `${zoneAreas.length} area(s) selected. Save to apply.`;
+      $("zoneStatus").textContent = zoneMode === 'vehicle' ? (zoneAreas.length ? 'Vehicle area selected. Save to apply.' : 'No area drawn: the whole camera view will be checked.') : `${zoneAreas.length} area(s) selected. Save to apply.`;
     }
 
     function zoneRectangle(a, b) {
-      return [Math.min(a[0],b[0]), Math.min(a[1],b[1]), Math.abs(a[0]-b[0]), Math.abs(a[1]-b[1])];
+      const x = Math.min(a[0],b[0]), y = Math.min(a[1],b[1]);
+      return [x, y, Math.min(1-x, Math.abs(a[0]-b[0])), Math.min(1-y, Math.abs(a[1]-b[1]))];
     }
 
-    function openZoneEditor(sourceId) {
+    function openZoneEditor(sourceId, mode = 'exclusions') {
       const preview = state.previews.get(sourceId);
       if (!preview || !preview.previewEnabled) return;
       zoneCamera = sourceId;
-      zoneAreas = (preview.excludedAreas || []).map((area) => [...area]);
+      zoneMode = mode;
+      zoneAreas = mode === 'vehicle' ? [[...(preview.vehicleArea || [0,0,1,1])]] : (preview.excludedAreas || []).map((area) => [...area]);
+      zoneSelected = zoneAreas.length - 1;
+      zoneAction = null; zoneHistory = [];
       zoneStart = zoneCurrent = null;
-      $("zoneTitle").textContent = `Excluded areas — ${preview.label}`;
+      $("zoneTitle").textContent = `${mode === 'vehicle' ? 'Vehicle detection area' : 'Excluded areas'} — ${preview.label}`;
+      $("zoneHelp").textContent = mode === 'vehicle' ? 'Drag inside the area to move it; drag a white handle to resize. Draw outside it to replace it, or clear all to use the whole view. Motion exclusions are separate.' : 'Draw on an empty part of the image to add an area. Drag inside an area to move it, or drag a white handle to resize. Motion inside shaded areas is ignored.';
       $("zoneImage").src = `/preview/${encodeURIComponent(sourceId)}`;
       $("zoneDialog").showModal();
       drawZones();
@@ -1452,39 +1620,56 @@ INDEX_HTML = r"""<!doctype html>
       $("zoneDialog").close();
       $("zoneImage").removeAttribute("src");
       zoneCamera = null;
+      zoneAction = null;
     }
 
     $("zoneCanvas").addEventListener("pointerdown", (event) => {
       if (event.button !== 0 || !$("zoneImage").naturalWidth) return;
       event.preventDefault();
-      zoneStart = zoneCurrent = zonePoint(event);
+      const point = zonePoint(event), hit = zoneHit(point);
+      zoneRemember();
+      zoneAction = {...hit, start:point, original:hit.index === undefined ? null : [...zoneAreas[hit.index]]};
+      if (hit.type === 'draw') { zoneStart = zoneCurrent = point; zoneSelected = -1; }
+      else { zoneSelected = hit.index; zoneStart = zoneCurrent = null; }
       event.currentTarget.setPointerCapture(event.pointerId);
       drawZones();
     });
     $("zoneCanvas").addEventListener("pointermove", (event) => {
-      if (!zoneStart) return;
-      zoneCurrent = zonePoint(event);
+      if (!zoneAction) return;
+      if (zoneAction.type === 'draw') zoneCurrent = zonePoint(event);
+      else applyZoneAction(zonePoint(event));
       drawZones();
     });
     $("zoneCanvas").addEventListener("pointerup", (event) => {
-      if (!zoneStart) return;
-      const area = zoneRectangle(zoneStart, zonePoint(event));
-      zoneStart = zoneCurrent = null;
-      if (area[2] >= .005 && area[3] >= .005 && zoneAreas.length < 20) zoneAreas.push(area);
+      if (!zoneAction) return;
+      if (zoneAction.type === 'draw') {
+        const area = zoneRectangle(zoneStart, zonePoint(event));
+        if (area[2] >= .005 && area[3] >= .005) {
+          if (zoneMode === 'vehicle') zoneAreas = [area];
+          else if (zoneAreas.length < 20) zoneAreas.push(area);
+          zoneSelected = zoneAreas.length - 1;
+        } else zoneHistory.pop();
+      } else {
+        applyZoneAction(zonePoint(event));
+      }
+      zoneStart = zoneCurrent = null; zoneAction = null;
       drawZones();
     });
-    $("zoneCanvas").addEventListener("pointercancel", () => { zoneStart = zoneCurrent = null; drawZones(); });
-    $("zoneUndo").addEventListener("click", () => { zoneAreas.pop(); drawZones(); });
-    $("zoneClear").addEventListener("click", () => { zoneAreas = []; drawZones(); });
+    $("zoneCanvas").addEventListener("pointercancel", () => { if (zoneAction && zoneHistory.length) zoneAreas = zoneHistory.pop(); zoneStart = zoneCurrent = zoneAction = null; zoneSelected = -1; drawZones(); });
+    $("zoneUndo").addEventListener("click", () => { if (zoneHistory.length) { zoneAreas = zoneHistory.pop(); zoneSelected = zoneAreas.length - 1; drawZones(); } });
+    $("zoneRemove").addEventListener("click", () => { if (zoneSelected >= 0) { zoneRemember(); zoneAreas.splice(zoneSelected,1); zoneSelected = zoneAreas.length - 1; drawZones(); } });
+    $("zoneClear").addEventListener("click", () => { if (zoneAreas.length) { zoneRemember(); zoneAreas = []; zoneSelected = -1; drawZones(); } });
     $("zoneCancel").addEventListener("click", closeZoneEditor);
     $("zoneDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeZoneEditor(); });
     $("zoneSave").addEventListener("click", async () => {
       if (!zoneCamera) return;
       $("zoneSave").disabled = true;
       try {
-        const data = await jsonFetch("/api/stream/exclusions", {source_id:zoneCamera, excluded_areas:zoneAreas});
+        const data = zoneMode === 'vehicle'
+          ? await jsonFetch("/api/stream/vehicle-area", {source_id:zoneCamera, vehicle_area:zoneAreas[0] || [0,0,1,1]})
+          : await jsonFetch("/api/stream/exclusions", {source_id:zoneCamera, excluded_areas:zoneAreas});
         const preview = state.previews.get(zoneCamera);
-        if (preview) preview.excludedAreas = data.excluded_areas;
+        if (preview) { if (zoneMode === 'vehicle') preview.vehicleArea = data.vehicle_area; else preview.excludedAreas = data.excluded_areas; }
         closeZoneEditor();
       } catch (error) {
         $("zoneStatus").textContent = error.message;
@@ -1525,7 +1710,7 @@ INDEX_HTML = r"""<!doctype html>
         const data = await response.json();
         const activeIds = new Set(data.workers.map((worker) => worker.source_id));
         for (const worker of data.workers) {
-          addPreview(worker.source_id, worker.label, worker.preview_enabled, worker.excluded_areas || [], worker.recording, worker.status, worker.object_recording, worker.object_detection_status, worker.sensitivity);
+          addPreview(worker.source_id, worker.label, worker.preview_enabled, worker.excluded_areas || [], worker.recording, worker.status, worker.object_recording, worker.object_detection_status, worker.sensitivity, worker.vehicle_area, worker.object_processing, worker.detected_objects || []);
         }
         for (const sourceId of Array.from(state.previews.keys())) {
           if (!activeIds.has(sourceId)) state.previews.delete(sourceId);
@@ -1592,11 +1777,13 @@ INDEX_HTML = r"""<!doctype html>
       const previewEnabled = event.target.dataset.previewEnabled;
       const mediaFolder = event.target.dataset.mediaFolder;
       const zoneId = event.target.dataset.zoneId;
+      const vehicleZoneId = event.target.dataset.vehicleZoneId;
       if (startIndex !== undefined) startStream(Number(startIndex));
       if (stopId !== undefined) stopSource(decodeURIComponent(stopId));
       if (previewId !== undefined) setPreviewEnabled(decodeURIComponent(previewId), previewEnabled === "1");
       if (mediaFolder !== undefined) loadMedia(mediaFolder);
       if (zoneId !== undefined) openZoneEditor(decodeURIComponent(zoneId));
+      if (vehicleZoneId !== undefined) openZoneEditor(decodeURIComponent(vehicleZoneId), 'vehicle');
     });
 
     loadDefaults();

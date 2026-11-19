@@ -18,7 +18,7 @@ def dotenv_candidate_paths():
     )
 
 
-def load_dotenv() -> None:
+def load_dotenv(override_empty_keys=()) -> None:
     for env_path in dotenv_candidate_paths():
         if not env_path.is_file():
             continue
@@ -31,6 +31,6 @@ def load_dotenv() -> None:
             key, value = stripped_line.split("=", 1)
             key = key.strip()
             value = value.strip().strip("\"'")
-            if key and key not in os.environ:
+            if key and (key not in os.environ or (key in override_empty_keys and not os.environ.get(key, '').strip())):
                 os.environ[key] = value
         return

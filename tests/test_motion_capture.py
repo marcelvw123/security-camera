@@ -40,12 +40,13 @@ class MotionCaptureTests(unittest.TestCase):
             self.assertNotEqual(finalize.call_args.kwargs.get('reason'), 'stream_stopped')
 
     def test_motion_clip_finalization_is_local_only(self):
-        with patch.object(core, 'upload_clip_async') as upload:
+        with patch.object(core, 'upload_clip_async') as upload, patch.object(core, 'log_trigger_step') as log:
             status, analysis = MagicMock(), MagicMock()
             core.finalize_recorded_clip('/tmp/motion_test.mp4', 'camera', None,
                                         upload_on_motion=True, status_callback=status,
                                         analysis_callback=analysis)
         upload.assert_not_called()
+        self.assertEqual(log.call_args.args[1], 'MOTION_CLIP_SAVED')
         status.assert_called_once()
         self.assertIn('locally', analysis.call_args.args[1])
 
@@ -130,6 +131,12 @@ class MotionCaptureTests(unittest.TestCase):
                     difference_class.return_value = candidate
                     core.run_detection('rtsp://test', 'camera', set(), stop, motion_algorithm='difference')
                 self.assertEqual(create.called, fails)
+
+    def test_lowest_sensitivity_uses_higher_pixel_threshold(self):
+        with patch.object(core, 'FrameDifferenceMotion') as difference:
+            core.run_detection('rtsp://test', 'camera', set(), lambda: True,
+                               motion_sensitivity=1, motion_algorithm='difference')
+        self.assertEqual(difference.call_args.kwargs['pixel_threshold'], 20)
 
 
 if __name__ == '__main__':

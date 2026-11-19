@@ -4,6 +4,7 @@ import math
 import threading
 import time
 import os
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 
@@ -11,7 +12,7 @@ VEHICLES = {'car', 'motorcycle', 'bus', 'truck'}
 
 
 class ObjectGate:
-    """Confirm people across samples; require vehicle displacement to exclude parked cars."""
+    """Confirm people across samples."""
     def __init__(self, quiet_seconds=8):
         self.previous = []
         self.previous_time = None
@@ -24,31 +25,24 @@ class ObjectGate:
         if self.previous_time is not None and 0 < timestamp - self.previous_time <= 8:
             used = set()
             for label, box, confidence in detections:
-                category = 'vehicle' if label in VEHICLES else label
-                if category not in ('person', 'vehicle'):
+                category = label
+                if category != 'person':
                     continue
                 x1, y1, x2, y2 = box
                 cx, cy = (x1+x2)/2, (y1+y2)/2
                 choices = []
                 for i, (old_label, old_box, _) in enumerate(self.previous):
-                    old_category = 'vehicle' if old_label in VEHICLES else old_label
+                    old_category = old_label
                     if i in used or old_category != category:
                         continue
                     ox1, oy1, ox2, oy2 = old_box
                     distance = math.hypot(cx-(ox1+ox2)/2, cy-(oy1+oy2)/2)
-                    if category == 'vehicle':
-                        old_width, old_height = max(1, ox2-ox1), max(1, oy2-oy1)
-                        new_width, new_height = max(1, x2-x1), max(1, y2-y1)
-                        if (max(old_width, new_width) / min(old_width, new_width) > 1.8 or
-                                max(old_height, new_height) / min(old_height, new_height) > 1.8):
-                            continue
                     if distance <= max(width*.10, x2-x1, ox2-ox1):
                         choices.append((distance, i))
                 if choices:
                     distance, i = min(choices)
                     used.add(i)
-                    if category == 'person' or distance >= max(12, width*.015):
-                        matches.append(category)
+                    matches.append(category)
         self.previous, self.previous_time = detections, timestamp
         if matches:
             self.last_seen = timestamp
@@ -60,23 +54,26 @@ class ObjectGate:
         return []
 
 
-class RoadEntryGate:
-    """Trigger on a newly detected road vehicle after an observed empty road."""
-    def __init__(self, cooldown=20):
-        self.empty_at = None
-        self.last_event = -float('inf')
-        self.cooldown = cooldown
+class VehicleDetectionGate:
+    """Start immediately on a detection, and rearm after a quiet sampled period."""
+    def __init__(self, quiet_seconds=8):
+        self.active = False
+        self.last_seen = None
+        self.last_sample = None
+        self.quiet_seconds = quiet_seconds
 
-    def update(self, timestamp, detections):
-        if not detections:
-            self.empty_at = timestamp
+    def update(self, timestamp, labels):
+        detected = any(label in VEHICLES for label in labels)
+        if self.last_sample is not None and timestamp < self.last_sample and not detected:
             return False
-        if (self.empty_at is not None and 0 < timestamp - self.empty_at <= 8
-                and timestamp - self.last_event >= self.cooldown):
-            self.empty_at = None
-            self.last_event = timestamp
-            return True
-        self.empty_at = None
+        self.last_sample = max(timestamp, self.last_sample or timestamp)
+        if detected:
+            self.last_seen = max(timestamp, self.last_seen or timestamp)
+            if not self.active:
+                self.active = True
+                return True
+        elif self.active and self.last_seen is not None and timestamp - self.last_seen >= self.quiet_seconds:
+            self.active = False
         return False
 
 
@@ -90,9 +87,11 @@ class SharedObjectDetector:
         self.results = {}
         self.last_submitted = {}
         self.generations = {}
+        self.processing_camera = None
         self.status = 'starting'
         token_file = os.getenv('REMOTE_VEHICLE_TOKEN_FILE', '').strip()
-        self.remote_shadow = RemoteVehicleShadow(token_file) if token_file else None
+        local_model = os.getenv('LOCAL_VEHICLE_MODEL', '').strip()
+        self.remote_shadow = LocalVehicleVerifier(local_model) if local_model else (RemoteVehicleShadow(token_file) if token_file else None)
         self.thread = threading.Thread(target=self._run, daemon=True, name='object-inference')
         self.thread.start()
 
@@ -122,11 +121,21 @@ class SharedObjectDetector:
     def take_remote(self, camera):
         return self.remote_shadow.take(camera) if self.remote_shadow else None
 
+    def vehicle_crop_revision(self, camera):
+        verifier = self.remote_shadow
+        return verifier.crop_revision(camera) if isinstance(verifier, LocalVehicleVerifier) else None
+
+    def is_processing(self, camera):
+        with self.condition:
+            processing = self.processing_camera == camera
+        return processing or bool(self.remote_shadow and self.remote_shadow.is_processing(camera))
+
     def _run(self):
         try:
             import torch
             from ultralytics import YOLO
-            torch.set_num_threads(1)
+            if not os.getenv('LOCAL_VEHICLE_MODEL', '').strip():
+                torch.set_num_threads(1)
             if not self.model_path.is_file():
                 raise FileNotFoundError('Object model file not found')
             model = YOLO(str(self.model_path))
@@ -135,17 +144,20 @@ class SharedObjectDetector:
                 with self.condition:
                     self.condition.wait_for(lambda: bool(self.pending))
                     camera, (frame, timestamp, generation) = self.pending.popitem(last=False)
+                    self.processing_camera = camera
                 result = model.predict(frame, classes=[0, 2, 3, 5, 7], conf=.35,
                                        imgsz=640, device='cpu', verbose=False)[0]
                 detections = [(model.names[int(cls)], [float(v) for v in box], float(conf))
                               for box, conf, cls in zip(result.boxes.xyxy, result.boxes.conf, result.boxes.cls)]
                 with self.condition:
+                    self.processing_camera = None
                     if generation == self.generations.get(camera, 0):
-                        self.results[camera] = (timestamp, frame.shape[1], detections)
+                        self.results[camera] = (timestamp, frame.shape[1], detections, frame if detections else None)
         except Exception:
             logging.exception('Object detection stopped')
             with self.condition:
                 self.status = 'error'
+                self.processing_camera = None
                 self.pending.clear()
 
 class RemoteVehicleShadow:
@@ -158,6 +170,7 @@ class RemoteVehicleShadow:
         self.last_error = 0
         self.results = {}
         self.generations = {}
+        self.processing_camera = None
         threading.Thread(target=self._run, daemon=True, name='remote-vehicle-shadow').start()
 
     @staticmethod
@@ -191,6 +204,10 @@ class RemoteVehicleShadow:
         with self.condition:
             return self.results.pop(camera, None)
 
+    def is_processing(self, camera):
+        with self.condition:
+            return self.processing_camera == camera
+
     def _run(self):
         import cv2
         import json
@@ -200,6 +217,7 @@ class RemoteVehicleShadow:
             with self.condition:
                 self.condition.wait_for(lambda: bool(self.pending))
                 camera, (frame, timestamp, generation) = self.pending.popitem(last=False)
+                self.processing_camera = camera
             try:
                 ok, image = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                 if not ok:
@@ -214,7 +232,7 @@ class RemoteVehicleShadow:
                     raise ValueError('invalid verifier response')
                 with self.condition:
                     if generation == self.generations.get(camera, 0):
-                        self.results[camera] = (timestamp, data['detections'])
+                        self.results[camera] = (timestamp, data['detections'], frame if data['detections'] else None)
                 if data.get('detections'):
                     logging.info('REMOTE_VEHICLE_SHADOW camera=%s detections=%s', camera, data['detections'])
             except Exception as exc:
@@ -222,6 +240,85 @@ class RemoteVehicleShadow:
                 if now - self.last_error >= 60:
                     logging.warning('Remote vehicle verifier unavailable: %s', type(exc).__name__)
                     self.last_error = now
+            finally:
+                with self.condition:
+                    self.processing_camera = None
+
+
+class LocalVehicleVerifier(RemoteVehicleShadow):
+    """Analyze one latest road frame at a time on the Pi, without a network service."""
+    CROPS = {'manual:701': (.46875, .13889, .390625, .33333),
+             'manual:801': (0, .0868, .4375, .3125)}
+
+    @classmethod
+    def default_crop(cls, camera):
+        canonical = RemoteVehicleShadow.verifier_camera(camera)
+        return list(cls.CROPS.get(canonical, (0, 0, 1, 1)))
+
+    @staticmethod
+    def verifier_camera(camera):
+        return camera if camera else None
+
+    def __init__(self, model_path):
+        self.model_path = Path(model_path)
+        self.condition = threading.Condition()
+        self.pending, self.last_submitted, self.results, self.generations = OrderedDict(), {}, {}, {}
+        self.processing_camera = None
+        self.crops = {}
+        self.last_error = 0
+        self.status = 'starting'
+        threading.Thread(target=self._run, daemon=True, name='local-vehicle-verifier').start()
+
+    def set_crop(self, camera, crop):
+        from motion_difference import FrameDifferenceMotion
+        FrameDifferenceMotion.validate_exclusions([crop])
+        with self.condition:
+            self.crops[camera] = list(crop)
+            self.pending.pop(camera, None)
+            self.results.pop(camera, None)
+            self.last_submitted.pop(camera, None)
+            self.generations[camera] = self.generations.get(camera, 0) + 1
+
+    def crop_revision(self, camera):
+        with self.condition:
+            return self.generations.get(camera, 0)
+
+    def _run(self):
+        try:
+            import torch
+            from ultralytics import YOLO
+            torch.set_num_threads(2)
+            if not self.model_path.is_file():
+                raise FileNotFoundError('Local vehicle model not found')
+            model = YOLO(str(self.model_path))
+            self.status = 'ready'
+            logging.info('Local vehicle verifier ready')
+            while True:
+                with self.condition:
+                    self.condition.wait_for(lambda: bool(self.pending))
+                    camera, (frame, timestamp, generation) = self.pending.popitem(last=False)
+                    self.processing_camera = camera
+                    x, y, w, h = self.crops.get(camera, self.default_crop(camera))
+                height, width = frame.shape[:2]
+                x1, y1 = int(x*width), int(y*height)
+                x2, y2 = max(x1+1, min(width, math.ceil((x+w)*width))), max(y1+1, min(height, math.ceil((y+h)*height)))
+                prediction = model.predict(frame[y1:y2, x1:x2], classes=[2, 3, 5, 7], conf=.1,
+                                           imgsz=416, device='cpu', verbose=False)[0]
+                detections = [{'label': model.names[int(cls)], 'confidence': round(float(conf), 3),
+                               'box': [round(float(box[0])+x1, 1), round(float(box[1])+y1, 1),
+                                       round(float(box[2])+x1, 1), round(float(box[3])+y1, 1)]}
+                              for box, conf, cls in zip(prediction.boxes.xyxy, prediction.boxes.conf, prediction.boxes.cls)]
+                with self.condition:
+                    self.processing_camera = None
+                    if generation == self.generations.get(camera, 0):
+                        self.results[camera] = (timestamp, detections, frame if detections else None)
+                if detections:
+                    logging.info('LOCAL_VEHICLE camera=%s detections=%s', camera, detections)
+        except Exception:
+            self.status = 'error'
+            with self.condition:
+                self.processing_camera = None
+            logging.exception('Local vehicle verifier stopped')
 
 
 class ObjectClipRecorder:
@@ -234,7 +331,8 @@ class ObjectClipRecorder:
         self.fps, self.seconds = fps, seconds
         self.preroll = preroll
         self.gate = ObjectGate()
-        self.road_gate = RoadEntryGate()
+        self.vehicle_gate = VehicleDetectionGate()
+        self.road_crop_revision = detector.vehicle_crop_revision(camera)
         self.writer = None
         self.end_time = self.next_frame = 0
         self.next_disk_check = 0
@@ -247,11 +345,25 @@ class ObjectClipRecorder:
             self.detector.submit(self.camera, frame, now)
         result = self.detector.take(self.camera)
         found = []
+        checked = []
+        evidence_checks = []
+        revision = self.detector.vehicle_crop_revision(self.camera)
+        if revision != self.road_crop_revision:
+            self.vehicle_gate = VehicleDetectionGate()
+            self.road_crop_revision = revision
         if result is not None and 0 <= now - result[0] <= 8:
+            labels = [d[0] for d in result[2]]
+            evidence_checks.append((result[0], labels, result[3] if len(result) > 3 else None,
+                                    [{'label': d[0], 'box': d[1], 'confidence': d[2]} for d in result[2]]))
             found = self.gate.update(result[2], result[0], result[1])
         remote = self.detector.take_remote(self.camera)
-        if remote is not None and 0 <= now - remote[0] <= 8 and self.road_gate.update(remote[0], remote[1]):
-            found = sorted(set(found + ['vehicle']))
+        if remote is not None and 0 <= now - remote[0] <= 8:
+            evidence_checks.append((remote[0], [d.get('label') for d in remote[1]], remote[2] if len(remote) > 2 else None, remote[1]))
+        for timestamp, labels, captured, boxes in sorted(evidence_checks, key=lambda item: item[0]):
+            evidence = self.save_evidence(captured, boxes) if labels else None
+            checked.append((timestamp, labels, evidence))
+            if self.vehicle_gate.update(timestamp, labels):
+                found = sorted(set(found + ['vehicle']))
         if found and self.writer is None:
                 self.output_dir.mkdir(parents=True, exist_ok=True)
                 if shutil.disk_usage(self.output_dir).free >= self.min_free_bytes:
@@ -260,12 +372,19 @@ class ObjectClipRecorder:
                     height, width = frame.shape[:2]
                     raw = self.writer_factory(path, self.fps, (width, height))
                     self.writer = AsyncPreRollWriter(raw, self.preroll, now, self.fps)
+                    from motion_clip_metadata import start_metadata
+                    start_metadata(self.writer.path)
                     self.end_time, self.next_frame = now + self.seconds, now
                     self.next_disk_check = now + 5
                     self.status_callback(True)
                     logging.info('Object clip started: camera=%s objects=%s file=%s', self.camera, found, path.name)
                 else:
                     logging.warning('Object clip skipped: disk reserve reached')
+        if self.writer:
+            from motion_clip_metadata import update_metadata
+            for _timestamp, labels, evidence in checked:
+                if labels:
+                    update_metadata(self.writer.path, labels, evidence)
         if self.writer:
             if now >= self.next_disk_check:
                 self.next_disk_check = now + 5
@@ -277,6 +396,55 @@ class ObjectClipRecorder:
                 self.next_frame += 1/self.fps
             if now >= self.end_time:
                 self.close()
+        return checked
+
+    def save_evidence(self, frame, detections):
+        """Store the actual full frame used by inference, annotated in source pixels."""
+        import cv2
+        import shutil
+        import tempfile
+        from datetime import datetime
+        if frame is None:
+            logging.warning('Detection frame unavailable for %s', self.camera)
+            return None
+        try:
+            folder = self.output_dir / 'detection_frames'
+            folder.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(folder).free < self.min_free_bytes:
+                logging.warning('Detection frame not saved: disk reserve reached')
+                return None
+            annotated = frame.copy()
+            height, width = annotated.shape[:2]
+            for detection in detections:
+                box = detection.get('box')
+                if not isinstance(box, (list, tuple)) or len(box) != 4:
+                    continue
+                x1, y1, x2, y2 = [int(round(float(value))) for value in box]
+                x1, x2 = max(0, min(width-1, x1)), max(0, min(width-1, x2))
+                y1, y2 = max(0, min(height-1, y1)), max(0, min(height-1, y2))
+                cv2.rectangle(annotated, (x1,y1), (x2,y2), (0,220,0), 2)
+                cv2.putText(annotated, str(detection.get('label', 'object')), (x1,max(15,y1-5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, .55, (0,220,0), 2)
+            ok, encoded = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                raise OSError('JPEG encoding failed')
+            safe_camera = ''.join(c if c.isalnum() or c in '_-' else '_' for c in self.camera)
+            name = f"detection_{safe_camera}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.jpg"
+            path = folder / name
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile('wb', dir=folder, prefix='.detection_', delete=False) as out:
+                    temporary = out.name
+                    out.write(encoded.tobytes())
+                    out.flush()
+                os.replace(temporary, path)
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.unlink(temporary)
+            return name
+        except (OSError, ValueError, TypeError, cv2.error):
+            logging.exception('Could not save detection frame for %s', self.camera)
+            return None
 
     def close(self):
         if self.writer:
@@ -285,6 +453,8 @@ class ObjectClipRecorder:
                 writer.release()
                 logging.info('Object clip saved: %s', writer.path)
             finally:
+                from motion_clip_metadata import finish_metadata
+                finish_metadata(writer.path)
                 self.status_callback(False)
 
     def stop(self):
@@ -296,4 +466,4 @@ class ObjectClipRecorder:
     def reset(self):
         self.stop()
         self.gate = ObjectGate()
-        self.road_gate = RoadEntryGate()
+        self.vehicle_gate = VehicleDetectionGate()

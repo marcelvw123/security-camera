@@ -26,7 +26,7 @@ class CloudUploadConfig:
 
     @classmethod
     def from_environment(cls) -> Optional["CloudUploadConfig"]:
-        load_dotenv()
+        load_dotenv(override_empty_keys=('API_BASE_URL', 'DEVICE_ID', 'DEVICE_TOKEN'))
         api_base_url = os.getenv("API_BASE_URL", "").strip().rstrip("/")
         device_id = os.getenv("DEVICE_ID", "").strip()
         device_token = os.getenv("DEVICE_TOKEN", "").strip()
@@ -97,7 +97,15 @@ def upload_file(
     clip_id = upload_details.get("clip_id") or upload_details.get("clipId")
     if clip_id:
         logging.info("Reporting cloud upload completion for clip_id=%s", clip_id)
-        complete_clip_upload(config, str(clip_id), upload_file_path, upload_details)
+        result = complete_clip_upload(config, str(clip_id), upload_file_path, upload_details)
+        if result is None:
+            logging.warning('Cloud upload completion failed for clip_id=%s', clip_id)
+            return False
+        if 'whatsapp_alert' in result:
+            logging.info('WhatsApp alert result for clip_id=%s: %s', clip_id, result['whatsapp_alert'])
+        if metadata.get('scenario') == 'object_detected' and result.get('whatsapp_alert') not in ('sent', 'partial_failed'):
+            logging.error('WhatsApp object alert not confirmed for clip_id=%s: %s', clip_id, result.get('whatsapp_alert', 'missing result'))
+            return False
 
     logging.info("Cloud upload completed for file: %s", upload_file_path)
     return True
@@ -200,7 +208,7 @@ def complete_clip_upload(
     clip_id: str,
     clip_file: Path,
     upload_details: Dict[str, Any],
-) -> None:
+) -> Optional[Dict[str, Any]]:
     payload = {
         "device_id": config.device_id,
         "filename": clip_file.name,
@@ -208,4 +216,4 @@ def complete_clip_upload(
         "blob_url": upload_details.get("blob_url") or upload_details.get("blobUrl"),
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
-    post_json(config, f"/clips/{clip_id}/complete", payload)
+    return post_json(config, f"/clips/{clip_id}/complete", payload)

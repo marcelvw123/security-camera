@@ -48,3 +48,5 @@ security_camera_headless.log
 # Camera-specific private settings
 motion_exclusions.json
 .motion_exclusions_*
+vehicle_detection_areas.json
+.vehicle_areas_*
