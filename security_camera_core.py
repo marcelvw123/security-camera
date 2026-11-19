@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Optional, Set
 from urllib.parse import quote
 
+from motion_difference import FrameDifferenceMotion
+from motion_preroll import AsyncPreRollWriter, MotionPreRoll
+from motion_shadow import MotionShadowComparison
 from runtime_warnings import configure_runtime_warnings
 
 configure_runtime_warnings()
@@ -108,6 +111,7 @@ YOLO_CLASS_ALIASES = parse_class_aliases(
     os.getenv("YOLO_CLASS_ALIASES", "pedestrian=person,human=person,people=person,pedestrians=person")
 )
 OUTPUT_DIR = Path.home() / "SecurityCamera" / "clips"
+OBJECT_OUTPUT_DIR = Path.home() / "SecurityCamera" / "object_clips"
 DEBUG_FRAME_DIR = Path.home() / "SecurityCamera" / "debug_frames"
 SCENARIO_FRAME_DIR = Path.home() / "SecurityCamera" / "scenario_frames"
 AVAILABLE_TARGET_OBJECTS = ("car", "person", "truck", "bus", "motorcycle")
@@ -121,7 +125,14 @@ READ_FAILURES_BEFORE_RECONNECT = int_env("RTSP_READ_FAILURES_BEFORE_RECONNECT", 
 DEFAULT_RECORDING_FPS = int_env("RECORDING_FPS", 20, min_value=1, max_value=60)
 UPLOAD_ON_MOTION = bool_env("UPLOAD_ON_MOTION", False)
 DETECT_DURING_RECORDING = bool_env("DETECT_DURING_RECORDING", False)
-DETECTION_INTERVAL_SECONDS = float_env("DETECTION_INTERVAL_SECONDS", 1.0, min_value=0.0)
+DETECTION_INTERVAL_SECONDS = float_env("DETECTION_INTERVAL_SECONDS", 0.5, min_value=0.0)
+MOTION_WARMUP_SECONDS = float_env("MOTION_WARMUP_SECONDS", 5.0, min_value=0.0)
+MOTION_PREROLL_SECONDS = float_env("MOTION_PREROLL_SECONDS", 3.0, min_value=0.0, max_value=10.0)
+MOTION_QUIET_SECONDS = float_env("MOTION_QUIET_SECONDS", 5.0, min_value=0.5)
+MOTION_SHADOW_ENABLED = bool_env("MOTION_SHADOW_ENABLED", False)
+MOTION_ALGORITHM = os.getenv("MOTION_ALGORITHM", "background").strip().lower()
+MOTION_MAX_CLIPS = int_env("MOTION_MAX_CLIPS", 500, min_value=1)
+MOTION_MIN_FREE_MB = int_env("MOTION_MIN_FREE_MB", 2048, min_value=100)
 RECORDING_READ_RETRY_SLEEP_SECONDS = float_env("RECORDING_READ_RETRY_SLEEP_SECONDS", 0.05, min_value=0.0)
 DEBUG_FRAMES_CONTAINER = os.getenv("DEBUG_FRAMES_CONTAINER", "debugframes").strip() or "debugframes"
 SCENARIO_FRAMES_CONTAINER = os.getenv("SCENARIO_FRAMES_CONTAINER", "scenarioframes").strip() or "scenarioframes"
@@ -428,11 +439,11 @@ def emit_recording_progress(analysis_callback, clip_path, clip_start_time, now, 
     if elapsed_seconds == last_recording_progress_second:
         return last_recording_progress_second
 
-    displayed_seconds = min(int(CLIP_SECONDS), elapsed_seconds)
+    displayed_seconds = elapsed_seconds
     progress = min(99, int((min(CLIP_SECONDS, now - clip_start_time) / CLIP_SECONDS) * 100))
     analysis_callback(
         Path(clip_path).name,
-        f"Recording clip: {displayed_seconds}/{int(CLIP_SECONDS)}s",
+        f"Recording clip: {displayed_seconds}s",
         progress,
     )
     return elapsed_seconds
@@ -697,19 +708,9 @@ def finalize_recorded_clip(
     )
     recorded_clip_path = Path(clip_path)
     if upload_on_motion:
-        upload_clip_async(str(recorded_clip_path), {
-            "camera": source_name,
-            "source_name": source_name,
-            "detected": [],
-            "detected_objects": [],
-            "clip_type": "motion",
-            "upload_on_motion": True,
-            "scenario": None,
-            "trigger_id": trigger_id,
-        })
-        log_trigger_step(trigger_id, "MOTION_UPLOAD_QUEUED", "clip=%s", recorded_clip_path)
+        # Motion-only mode keeps raw recordings local for independent review.
         status_callback(f"Motion clip saved: {recorded_clip_path.name}")
-        analysis_callback(recorded_clip_path.name, "Motion upload queued", 100)
+        analysis_callback(recorded_clip_path.name, "Motion clip saved locally", 100)
         return
 
     if DETECT_DURING_RECORDING:
@@ -864,13 +865,17 @@ def emit_preview_frame(frame, frame_callback):
         frame_callback(buffer.tobytes())
 
 
-def detect_motion(frame, motion_detector, sensitivity_config=None):
+def detect_motion(frame, motion_detector, sensitivity_config=None, exclusions=None):
     sensitivity_config = sensitivity_config or motion_sensitivity_config()
     frame_height, frame_width = frame.shape[:2]
     frame_area = frame_width * frame_height
     motion_mask = motion_detector.apply(frame)
     motion_mask = cv2.threshold(motion_mask, 244, 255, cv2.THRESH_BINARY)[1]
     motion_mask = cv2.dilate(motion_mask, None, iterations=2)
+    for x, y, w, h in exclusions or ():
+        x1, y1 = int(x * frame_width), int(y * frame_height)
+        x2, y2 = int((x+w) * frame_width + .999999), int((y+h) * frame_height + .999999)
+        motion_mask[y1:y2, x1:x2] = 0
 
     contours, _ = cv2.findContours(
         motion_mask,
@@ -1144,10 +1149,23 @@ def run_detection(
     analysis_callback=noop_analysis_callback,
     yolo_model_filename=None,
     upload_on_motion=None,
+    excluded_areas=None,
+    motion_algorithm=None,
+    exclusions_provider=None,
+    object_detector=None,
+    object_status_callback=None,
+    object_source_id=None,
 ):
-    upload_on_motion = UPLOAD_ON_MOTION if upload_on_motion is None else upload_on_motion
+    # This branch deliberately runs motion capture only, regardless of legacy settings.
+    upload_on_motion = True
     sensitivity_config = motion_sensitivity_config(motion_sensitivity)
-    model = None if upload_on_motion else load_yolo_model(yolo_model_filename)
+    exclusions = FrameDifferenceMotion.validate_exclusions(excluded_areas or [])
+    algorithm = motion_algorithm or MOTION_ALGORITHM
+    if algorithm not in ('background', 'difference'):
+        raise ValueError('unknown motion algorithm')
+    difference = FrameDifferenceMotion(pixel_threshold=15,
+        min_area=max(1, int(200 * 5 / sensitivity_config.level)), exclusions=excluded_areas) if algorithm == 'difference' else None
+    model = None
     motion_detector = cv2.createBackgroundSubtractorMOG2(
         history=500,
         varThreshold=50,
@@ -1177,6 +1195,17 @@ def run_detection(
     last_overlay_matched_objects = set()
     frame_count = 0
     consecutive_read_failures = 0
+    motion_ready_at = float("inf")
+    preroll = MotionPreRoll(seconds=MOTION_PREROLL_SECONDS)
+    object_recorder = None
+    if object_detector is not None:
+        from object_detection import ObjectClipRecorder
+        object_recorder = ObjectClipRecorder(object_detector, object_source_id or window_title, OBJECT_OUTPUT_DIR,
+            create_video_writer, object_status_callback or (lambda _recording: None), preroll,
+            MOTION_MIN_FREE_MB * 1024 * 1024)
+    shadow = MotionShadowComparison(window_title) if MOTION_SHADOW_ENABLED else None
+    storage_warning_at = 0.0
+    next_recording_space_check = 0.0
     logging.info(
         "Motion sensitivity for %s: level=%s min_motion_area=%s detect_during_recording=%s detection_interval_seconds=%s",
         window_title,
@@ -1195,6 +1224,15 @@ def run_detection(
                     wait_before_reconnect(stop_requested)
                     continue
 
+                # A new stream needs a fresh background, including after reconnect.
+                motion_detector = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
+                preroll.clear()
+                if difference is not None:
+                    difference.reset()
+                if shadow is not None:
+                    shadow.reset()
+                motion_ready_at = time.monotonic() + MOTION_WARMUP_SECONDS
+                next_detection_time = 0.0
                 reported_fps = cap.get(cv2.CAP_PROP_FPS)
                 fps = normalized_recording_fps(reported_fps)
                 consecutive_read_failures = 0
@@ -1212,6 +1250,8 @@ def run_detection(
 
             if not ret:
                 consecutive_read_failures += 1
+                if object_recorder is not None and consecutive_read_failures == READ_FAILURES_BEFORE_RECONNECT:
+                    object_recorder.reset()
                 if writer is not None and last_recording_frame is not None and last_recording_raw_frame is not None:
                     now = time.monotonic()
                     next_clip_frame_time = write_recording_frames_until(
@@ -1234,7 +1274,7 @@ def run_detection(
                     if now < clip_end_time:
                         if consecutive_read_failures == READ_FAILURES_BEFORE_RECONNECT:
                             logging.warning(
-                                "RTSP read failures during active recording for %s; keeping clip open and retrying until the 20 second recording completes.",
+                                "RTSP read failures during active recording for %s; keeping clip open and retrying until the recording window ends.",
                                 window_title,
                             )
                         if RECORDING_READ_RETRY_SLEEP_SECONDS:
@@ -1318,7 +1358,9 @@ def run_detection(
             consecutive_read_failures = 0
 
             loop_now = time.monotonic()
-            skip_detection_for_recording = writer is not None and (upload_on_motion or not DETECT_DURING_RECORDING)
+            preroll.add(loop_now, frame)
+            # Keep the background model and live motion display current during recording.
+            skip_detection_for_recording = False
             detection_due = DETECTION_INTERVAL_SECONDS <= 0 or loop_now >= next_detection_time
             motion_boxes = []
             motion_detected = False
@@ -1329,8 +1371,27 @@ def run_detection(
 
             if not skip_detection_for_recording and detection_due:
                 next_detection_time = loop_now + DETECTION_INTERVAL_SECONDS
-                motion_boxes = detect_motion(frame, motion_detector, sensitivity_config)
-                motion_detected = bool(motion_boxes)
+                if exclusions_provider is not None:
+                    # The web app validates and atomically publishes each camera's areas.
+                    exclusions = exclusions_provider()
+                    if difference is not None:
+                        difference.exclusions = exclusions
+                raw_boxes = detect_motion(frame, motion_detector, sensitivity_config, exclusions) if exclusions else detect_motion(frame, motion_detector, sensitivity_config)
+                motion_boxes = raw_boxes
+                if difference is not None:
+                    try:
+                        primed = (difference.previous_time is not None and 0 < loop_now - difference.previous_time <= difference.max_gap_seconds)
+                        candidate_boxes = difference.observe(frame, loop_now)
+                        if primed:
+                            motion_boxes = candidate_boxes
+                    except Exception:
+                        logging.exception('Frame difference failed for %s; falling back to background detection', window_title)
+                        difference = None
+                motion_detected = bool(motion_boxes) and loop_now >= motion_ready_at
+                if writer is not None and motion_detected:
+                    clip_end_time = max(clip_end_time, loop_now + MOTION_QUIET_SECONDS)
+                if shadow is not None:
+                    shadow.observe(frame, loop_now, bool(raw_boxes), eligible=loop_now >= motion_ready_at)
 
                 if motion_detected:
                     if writer is None and pending_trigger_id is None:
@@ -1398,6 +1459,19 @@ def run_detection(
                     last_overlay_matched_objects,
                 )
 
+            # Never delete user footage to make room. Stop creating new clips at the
+            # configured cap or reserve, while leaving preview and detection running.
+            if writer is None and motion_detected:
+                clip_count = sum(1 for path in OUTPUT_DIR.glob("motion_*") if path.is_file())
+                enough_space = shutil.disk_usage(OUTPUT_DIR).free >= MOTION_MIN_FREE_MB * 1024 * 1024
+                if clip_count >= MOTION_MAX_CLIPS or not enough_space:
+                    if loop_now >= storage_warning_at:
+                        status_callback("Motion recording paused: clip limit or disk reserve reached")
+                        logging.warning("Motion recording paused: count=%s limit=%s enough_space=%s", clip_count, MOTION_MAX_CLIPS, enough_space)
+                        storage_warning_at = loop_now + 60
+                    motion_detected = False
+                    pending_trigger_id = None
+
             if writer is None and (matched_objects or (upload_on_motion and motion_detected)):
                 if pending_trigger_id is None:
                     pending_trigger_id = new_trigger_id()
@@ -1415,12 +1489,13 @@ def run_detection(
                         window_title,
                         matched_objects,
                     )
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 safe_window_title = safe_file_stem(window_title)
                 clip_prefix = "motion" if upload_on_motion else ("annotated_pending_scenario" if DETECT_DURING_RECORDING else "pending_scenario")
                 clip_path = OUTPUT_DIR / f"{clip_prefix}_{safe_window_title}_{timestamp}.mp4"
                 height, width = annotated_frame.shape[:2]
-                writer = create_video_writer(clip_path, fps, (width, height))
+                raw_writer = create_video_writer(clip_path, fps, (width, height))
+                writer = AsyncPreRollWriter(raw_writer, preroll, loop_now, fps)
                 clip_path = writer.path
                 active_clip_path = clip_path
                 active_clip_objects = set(relevant_objects)
@@ -1435,9 +1510,10 @@ def run_detection(
                 pending_trigger_id = None
                 clip_start_time = time.monotonic()
                 clip_end_time = clip_start_time + CLIP_SECONDS
+                next_recording_space_check = clip_start_time + 5.0
                 next_clip_frame_time = clip_start_time
                 last_recording_progress_second = -1
-                last_recording_frame = annotated_frame.copy()
+                last_recording_frame = frame.copy()
                 last_recording_raw_frame = frame.copy()
                 log_trigger_step(
                     active_trigger_id,
@@ -1481,17 +1557,37 @@ def run_detection(
                 )
                 pending_trigger_id = None
 
+            if object_recorder is not None:
+                try:
+                    object_recorder.observe(frame, loop_now, bool(writer is not None or motion_detected))
+                except Exception:
+                    logging.exception('Object clip processing failed for %s', window_title)
+                    try:
+                        object_recorder.stop()
+                    except Exception:
+                        logging.exception('Could not close object clip for %s', window_title)
+                    if object_status_callback:
+                        object_status_callback('error')
+                    object_recorder = None
+
             if writer is not None:
                 active_clip_objects.update(relevant_objects)
 
+                if loop_now >= next_recording_space_check:
+                    next_recording_space_check = loop_now + 5.0
+                    if shutil.disk_usage(OUTPUT_DIR).free < MOTION_MIN_FREE_MB * 1024 * 1024:
+                        logging.warning("Stopping motion recording for %s: disk reserve reached", window_title)
+                        status_callback("Motion recording paused: disk reserve reached")
+                        clip_end_time = min(clip_end_time, loop_now)
+
             if writer is not None:
-                last_recording_frame = annotated_frame.copy()
+                last_recording_frame = frame.copy()
                 last_recording_raw_frame = frame.copy()
                 now = time.monotonic()
                 next_clip_frame_time = write_recording_frames_until(
                     writer,
                     None,
-                    annotated_frame,
+                    frame,
                     frame,
                     fps,
                     clip_end_time,
@@ -1538,6 +1634,11 @@ def run_detection(
             if frame_count % PREVIEW_EVERY_N_FRAMES == 0:
                 emit_preview_frame(annotated_frame, frame_callback)
     finally:
+        if object_recorder is not None:
+            try:
+                object_recorder.stop()
+            except Exception:
+                logging.exception('Could not close object clip for %s', window_title)
         if writer is not None:
             writer.release()
             if active_clip_path is not None:

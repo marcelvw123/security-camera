@@ -44,3 +44,7 @@ dist/
 # App logs
 security_camera_app.log
 security_camera_headless.log
+
+# Camera-specific private settings
+motion_exclusions.json
+.motion_exclusions_*

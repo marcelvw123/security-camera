@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,26 +24,54 @@ from urllib.parse import parse_qs, unquote, urlparse
 from app_config import load_dotenv
 from camera_discovery import DiscoveredStream, discover_nvr_streams
 from network_guess import likely_dvr_ip
+from motion_difference import FrameDifferenceMotion
 from security_camera_core import (
-    AVAILABLE_TARGET_OBJECTS,
     DEFAULT_RTSP_PATH_TEMPLATE,
     DEFAULT_RTSP_PORT,
-    DEFAULT_TARGET_OBJECTS,
-    DEBUG_FRAME_DIR,
     OUTPUT_DIR,
-    SCENARIO_FRAME_DIR,
-    YOLO_MODEL_FILENAME,
-    UPLOAD_ON_MOTION,
+    OBJECT_OUTPUT_DIR,
     build_rtsp_url,
     can_open_rtsp_channel,
     run_detection,
-    run_video_clip_detection,
 )
 
 
 LOG_FILE = "security_camera_web.log"
 DEFAULT_MOTION_SENSITIVITY = 5
-UPLOAD_DIR = Path.home() / "SecurityCamera" / "uploads"
+EXCLUSIONS_FILE = Path(__file__).resolve().parent / "motion_exclusions.json"
+EXCLUSIONS_LOCK = threading.RLock()
+
+
+def load_exclusion_map():
+    with EXCLUSIONS_LOCK:
+        if not EXCLUSIONS_FILE.exists():
+            return {}
+        data = json.loads(EXCLUSIONS_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("Invalid saved exclusion settings")
+        for areas in data.values():
+            FrameDifferenceMotion.validate_exclusions(areas)
+        return data
+
+
+def save_camera_exclusions(source_id, areas):
+    FrameDifferenceMotion.validate_exclusions(areas)
+    with EXCLUSIONS_LOCK:
+        data = load_exclusion_map()
+        data[source_id] = areas
+        EXCLUSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=EXCLUSIONS_FILE.parent, prefix=".motion_exclusions_", delete=False) as out:
+                temporary = out.name
+                json.dump(data, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, EXCLUSIONS_FILE)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 MEDIA_FOLDERS = {
@@ -52,19 +81,18 @@ MEDIA_FOLDERS = {
         "extensions": VIDEO_EXTENSIONS,
         "type": "video",
     },
-    "debug_frames": {
-        "label": "Debug Frames",
-        "path": DEBUG_FRAME_DIR,
-        "extensions": IMAGE_EXTENSIONS,
-        "type": "image",
-    },
-    "scenario_frames": {
-        "label": "Scenario Frames",
-        "path": SCENARIO_FRAME_DIR,
-        "extensions": IMAGE_EXTENSIONS,
-        "type": "image",
+    "object_clips": {
+        "label": "Object clips",
+        "path": OBJECT_OUTPUT_DIR,
+        "extensions": VIDEO_EXTENSIONS,
+        "type": "video",
     },
 }
+
+OBJECT_DETECTOR = None
+if os.getenv("OBJECT_DETECTION_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
+    from object_detection import SharedObjectDetector
+    OBJECT_DETECTOR = SharedObjectDetector(Path(__file__).resolve().parent / 'models' / 'yolo11n.pt')
 
 
 @dataclass
@@ -74,15 +102,25 @@ class WorkerState:
     stop_event: threading.Event
     thread: threading.Thread
     kind: str
+    sensitivity: int = 5
     status: str = "starting"
-    model_filename: str = ""
-    upload_on_motion: bool = False
+    object_recording: bool = False
+    object_error: bool = False
     preview_enabled: bool = True
-    analysis: dict = field(default_factory=dict)
     frame: bytes | None = None
     frame_version: int = 0
     condition: threading.Condition = field(default_factory=threading.Condition)
     started_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    excluded_areas: list = field(default_factory=list)
+    exclusions_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def current_exclusions(self):
+        with self.exclusions_lock:
+            return [list(area) for area in self.excluded_areas]
+
+    def set_exclusions(self, areas):
+        with self.exclusions_lock:
+            self.excluded_areas = [list(area) for area in areas]
 
 
 class WebAppState:
@@ -112,12 +150,14 @@ class WebAppState:
                     "source_id": worker.source_id,
                     "label": worker.label,
                     "kind": worker.kind,
+                    "sensitivity": worker.sensitivity,
                     "status": worker.status,
-                    "model_filename": worker.model_filename,
+                    "recording": worker.status.startswith("Recording clip:"),
+                    "object_recording": worker.object_recording,
+                    "object_detection_status": 'error' if worker.object_error else (OBJECT_DETECTOR.status if OBJECT_DETECTOR else 'disabled'),
                     "preview_enabled": worker.preview_enabled,
-                    "upload_on_motion": worker.upload_on_motion,
-                    "analysis": worker.analysis,
                     "started_at": worker.started_at,
+                    "excluded_areas": worker.current_exclusions(),
                 }
                 for worker in self.workers.values()
             ]
@@ -161,65 +201,6 @@ def default_settings():
     }
 
 
-def model_label(model_filename):
-    stem = Path(model_filename).stem.replace("_", " ").replace("-", " ")
-    labels = {
-        "llvip": "LLVIP",
-        "yolov5": "YOLOv5",
-        "yolov8": "YOLOv8",
-        "yolo11": "YOLO11",
-    }
-    words = []
-    for word in stem.split():
-        lower_word = word.lower()
-        for prefix, label in labels.items():
-            if lower_word.startswith(prefix):
-                words.append(f"{label}{word[len(prefix):]}")
-                break
-        else:
-            words.append(word.capitalize())
-    return " ".join(words)
-
-
-def available_yolo_models():
-    models = {}
-
-    def add_model(model_filename):
-        model_filename = str(model_filename).strip()
-        if not model_filename:
-            return
-        model_path = Path(model_filename).expanduser()
-        if model_path.is_absolute():
-            exists = model_path.is_file()
-            value = str(model_path)
-        else:
-            exists = (Path(__file__).resolve().parent / model_path).is_file()
-            value = model_filename
-        if exists:
-            models[value] = {"filename": value, "label": model_label(value)}
-
-    add_model(YOLO_MODEL_FILENAME)
-    models_dir = Path(__file__).resolve().parent / "models"
-    if models_dir.is_dir():
-        for path in sorted(models_dir.glob("*.pt")):
-            add_model(Path("models") / path.name)
-
-    if not models:
-        models[YOLO_MODEL_FILENAME] = {"filename": YOLO_MODEL_FILENAME, "label": model_label(YOLO_MODEL_FILENAME)}
-
-    return list(models.values())
-
-
-def selected_model_filename(raw_model_filename):
-    raw_model_filename = str(raw_model_filename or "").strip()
-    valid_models = {model["filename"] for model in available_yolo_models()}
-    if not raw_model_filename:
-        return YOLO_MODEL_FILENAME
-    if raw_model_filename not in valid_models:
-        raise ValueError("Unknown YOLO model selected.")
-    return raw_model_filename
-
-
 def optional_text(value):
     if value is None:
         return None
@@ -253,14 +234,6 @@ def stream_to_json(stream):
     }
 
 
-def selected_targets(raw_targets):
-    if not raw_targets:
-        return set(DEFAULT_TARGET_OBJECTS)
-
-    targets = {str(target).strip() for target in raw_targets}
-    return targets & set(AVAILABLE_TARGET_OBJECTS)
-
-
 def parse_sensitivity(value):
     try:
         parsed = int(value)
@@ -280,12 +253,10 @@ def update_status(worker, message):
     worker.status = message
 
 
-def update_analysis(worker, clip_name, message, progress):
-    worker.analysis = {
-        "clip_name": clip_name,
-        "message": message,
-        "progress": progress,
-    }
+def update_object_status(worker, value):
+    worker.object_recording = value is True
+    if value == 'error':
+        worker.object_error = True
 
 
 def preview_frame_callback(worker):
@@ -296,7 +267,7 @@ def preview_frame_callback(worker):
     return callback
 
 
-def run_camera_worker(worker, stream, settings, target_objects, sensitivity, model_filename):
+def run_camera_worker(worker, stream, settings, sensitivity, excluded_areas=None, motion_algorithm="difference"):
     try:
         if stream.rtsp_url:
             stream_url = stream.rtsp_url
@@ -317,14 +288,18 @@ def run_camera_worker(worker, stream, settings, target_objects, sensitivity, mod
         run_detection(
             stream_url,
             worker.label,
-            target_objects,
+            set(),
             worker.stop_event.is_set,
             preview_frame_callback(worker),
             sensitivity,
             lambda message: update_status(worker, message),
-            lambda clip_name, message, progress: update_analysis(worker, clip_name, message, progress),
-            model_filename,
-            upload_on_motion=worker.upload_on_motion,
+            upload_on_motion=True,
+            excluded_areas=excluded_areas,
+            motion_algorithm=motion_algorithm,
+            exclusions_provider=worker.current_exclusions,
+            object_detector=OBJECT_DETECTOR,
+            object_status_callback=lambda value: update_object_status(worker, value),
+            object_source_id=worker.source_id,
         )
     except Exception as exc:
         logging.exception("Browser stream failed: %s", worker.label)
@@ -334,42 +309,6 @@ def run_camera_worker(worker, stream, settings, target_objects, sensitivity, mod
         with worker.condition:
             worker.condition.notify_all()
         APP_STATE.remove_worker(worker.source_id)
-
-
-def run_video_worker(worker, video_path, target_objects, sensitivity, model_filename):
-    try:
-        worker.status = "running"
-        run_video_clip_detection(
-            str(video_path),
-            target_objects,
-            worker.stop_event.is_set,
-            preview_frame_callback(worker),
-            sensitivity,
-            model_filename,
-        )
-        worker.status = "complete"
-    except Exception as exc:
-        logging.exception("Browser video clip failed: %s", video_path)
-        worker.status = f"error: {exc}"
-    finally:
-        worker.stop_event.set()
-        with worker.condition:
-            worker.condition.notify_all()
-        APP_STATE.remove_worker(worker.source_id)
-
-
-def safe_upload_path(filename):
-    suffix = Path(filename).suffix.lower()
-    if suffix not in VIDEO_EXTENSIONS:
-        raise ValueError("Upload must be a video file: mp4, mov, avi, mkv, or m4v")
-
-    safe_stem = "".join(
-        character if character.isalnum() or character in {"-", "_"} else "_"
-        for character in Path(filename).stem
-    ).strip("_") or "video"
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return UPLOAD_DIR / f"{timestamp}_{safe_stem}{suffix}"
 
 
 def read_log_tail(max_bytes=60000):
@@ -452,12 +391,7 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             return self.send_json(
                 {
                     "settings": default_settings(),
-                    "available_target_objects": list(AVAILABLE_TARGET_OBJECTS),
-                    "default_target_objects": list(DEFAULT_TARGET_OBJECTS),
                     "default_motion_sensitivity": DEFAULT_MOTION_SENSITIVITY,
-                    "default_upload_on_motion": UPLOAD_ON_MOTION,
-                    "available_yolo_models": available_yolo_models(),
-                    "default_yolo_model": YOLO_MODEL_FILENAME,
                 }
             )
         if parsed.path == "/api/workers":
@@ -503,10 +437,10 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             return self.handle_stream_start()
         if parsed.path == "/api/stream/stop":
             return self.handle_stream_stop()
+        if parsed.path == "/api/stream/exclusions":
+            return self.handle_stream_exclusions()
         if parsed.path == "/api/preview/set":
             return self.handle_preview_set()
-        if parsed.path == "/api/video/start":
-            return self.handle_video_start(parsed)
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def handle_scan(self):
@@ -528,18 +462,16 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         if not stream.stream_id:
             return self.send_json({"error": "stream_id is required"}, HTTPStatus.BAD_REQUEST)
 
-        target_objects = selected_targets(payload.get("target_objects", []))
-        if not target_objects:
-            return self.send_json({"error": "Select at least one object to detect."}, HTTPStatus.BAD_REQUEST)
-
-        upload_on_motion = payload.get("upload_on_motion", UPLOAD_ON_MOTION)
-        if not isinstance(upload_on_motion, bool):
-            return self.send_json({"error": "upload_on_motion must be a boolean."}, HTTPStatus.BAD_REQUEST)
-
         sensitivity = parse_sensitivity(payload.get("sensitivity"))
+        algorithm = payload.get("motion_algorithm", "difference")
+        if algorithm not in ("difference", "background"):
+            return self.send_json({"error": "Invalid motion detection method."}, HTTPStatus.BAD_REQUEST)
         try:
-            model_filename = selected_model_filename(payload.get("model_filename"))
-        except ValueError as exc:
+            exclusions = payload.get("excluded_areas")
+            if exclusions is None:
+                exclusions = load_exclusion_map().get(stream.stream_id, [])
+            FrameDifferenceMotion.validate_exclusions(exclusions)
+        except (ValueError, OSError) as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
         stop_event = threading.Event()
@@ -549,12 +481,12 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             stop_event=stop_event,
             thread=None,
             kind="camera",
-            upload_on_motion=upload_on_motion,
-            model_filename=model_filename,
+            sensitivity=sensitivity,
+            excluded_areas=exclusions,
         )
         thread = threading.Thread(
             target=run_camera_worker,
-            args=(worker, stream, settings, target_objects, sensitivity, model_filename),
+            args=(worker, stream, settings, sensitivity, exclusions, algorithm),
             daemon=True,
         )
         worker.thread = thread
@@ -566,6 +498,22 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
 
         thread.start()
         self.send_json({"worker": {"source_id": worker.source_id, "label": worker.label}})
+
+    def handle_stream_exclusions(self):
+        payload = self.read_json()
+        source_id = str(payload.get("source_id", "")).strip()
+        areas = payload.get("excluded_areas")
+        worker = APP_STATE.get_worker(source_id)
+        if worker is None:
+            return self.send_json({"error": "Camera is not running."}, HTTPStatus.NOT_FOUND)
+        try:
+            FrameDifferenceMotion.validate_exclusions(areas)
+            save_camera_exclusions(source_id, areas)
+            worker.set_exclusions(areas)
+        except (ValueError, OSError) as exc:
+            logging.warning("Could not save motion exclusions: %s", type(exc).__name__)
+            return self.send_json({"error": "Could not save exclusion areas; check the rectangles and storage."}, HTTPStatus.BAD_REQUEST)
+        self.send_json({"source_id": source_id, "excluded_areas": worker.current_exclusions()})
 
     def handle_stream_stop(self):
         payload = self.read_json()
@@ -596,67 +544,6 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
                 worker.condition.notify_all()
         logging.info("Preview %s for %s", "enabled" if enabled else "disabled", worker.label)
         self.send_json({"source_id": source_id, "preview_enabled": worker.preview_enabled})
-
-    def handle_video_start(self, parsed):
-        query = parse_qs(parsed.query)
-        filename = query.get("filename", [""])[0]
-        if not filename:
-            return self.send_json({"error": "filename is required"}, HTTPStatus.BAD_REQUEST)
-
-        content_length = int(self.headers.get("Content-Length", "0"))
-        if content_length <= 0:
-            return self.send_json({"error": "Upload body is empty"}, HTTPStatus.BAD_REQUEST)
-
-        try:
-            video_path = safe_upload_path(filename)
-        except ValueError as exc:
-            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-
-        remaining = content_length
-        with video_path.open("wb") as output_file:
-            while remaining:
-                chunk = self.rfile.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                output_file.write(chunk)
-                remaining -= len(chunk)
-
-        if remaining:
-            return self.send_json({"error": "Upload ended before the complete file was received"}, HTTPStatus.BAD_REQUEST)
-
-        targets = selected_targets(query.get("targets", []))
-        if not targets:
-            targets = set(DEFAULT_TARGET_OBJECTS)
-        sensitivity = parse_sensitivity(query.get("sensitivity", [DEFAULT_MOTION_SENSITIVITY])[0])
-        try:
-            model_filename = selected_model_filename(query.get("model", [""])[0])
-        except ValueError as exc:
-            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-
-        source_id = f"clip:{video_path.name}"
-        stop_event = threading.Event()
-        worker = WorkerState(
-            source_id=source_id,
-            label=f"Video Clip: {video_path.name}",
-            stop_event=stop_event,
-            thread=None,
-            kind="video",
-            model_filename=model_filename,
-        )
-        thread = threading.Thread(
-            target=run_video_worker,
-            args=(worker, video_path, targets, sensitivity, model_filename),
-            daemon=True,
-        )
-        worker.thread = thread
-
-        try:
-            APP_STATE.add_worker(worker)
-        except ValueError as exc:
-            return self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
-
-        thread.start()
-        self.send_json({"worker": {"source_id": worker.source_id, "label": worker.label}})
 
     def send_preview(self, source_id):
         worker = APP_STATE.get_worker(source_id)
@@ -910,6 +797,9 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
       gap: 10px;
     }
+    .recording-indicator { display: inline-flex; align-items: center; gap: 6px; margin: 5px 0; font-size: 12px; font-weight: 700; color: #52606d; }
+    .recording-indicator.active { color: #b42318; }
+    .recording-indicator.active::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: #d92d20; }
     @media (min-width: 1320px) {
       .preview-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -969,6 +859,12 @@ INDEX_HTML = r"""<!doctype html>
       background: #101820;
       border-radius: 6px;
     }
+    dialog.zone-dialog { width: min(96vw, 1000px); max-height: 94vh; border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+    dialog.zone-dialog::backdrop { background: rgba(0,0,0,.65); }
+    .zone-stage { position: relative; width: fit-content; max-width: 100%; margin: auto; line-height: 0; background: #101820; }
+    .zone-stage img { width: auto; height: auto; max-width: 100%; max-height: calc(100vh - 240px); display: block; }
+    .zone-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+    .zone-help { color: var(--muted); margin: 8px 0; }
     .preview-placeholder {
       display: grid;
       place-items: center;
@@ -1137,7 +1033,7 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>Security Camera Browser Console</h1>
+    <h1>Motion Detection Console</h1>
     <div id="connectionStatus">Idle</div>
   </header>
 
@@ -1161,10 +1057,6 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <label for="rtspTemplate">RTSP Path Template</label>
         <input id="rtspTemplate">
-        <label>Record Objects</label>
-        <div id="targetObjects" class="checks"></div>
-        <label for="modelSelect">Detector Model</label>
-        <select id="modelSelect"></select>
         <div class="actions">
           <button id="scanButton">Connect</button>
           <button id="manualButton" class="secondary">Add Manual Channel</button>
@@ -1173,22 +1065,6 @@ INDEX_HTML = r"""<!doctype html>
         <input id="manualChannel" placeholder="101">
       </section>
 
-      <section>
-        <h2>Video Clip</h2>
-        <div class="video-controls">
-          <div>
-            <label for="videoFile">Upload Clip</label>
-            <input id="videoFile" type="file" accept=".mp4,.mov,.avi,.mkv,.m4v,video/*">
-          </div>
-          <div>
-            <label for="videoSensitivity">Sensitivity</label>
-            <input id="videoSensitivity" type="number" min="1" max="10" value="5">
-          </div>
-        </div>
-        <div class="actions">
-          <button id="uploadButton">Upload & Annotate</button>
-        </div>
-      </section>
     </div>
 
     <div class="stack">
@@ -1213,6 +1089,13 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
   </main>
+  <dialog id="zoneDialog" class="zone-dialog" aria-labelledby="zoneTitle">
+    <h2 id="zoneTitle">Draw excluded areas</h2>
+    <p class="zone-help">Drag on the image to add rectangles. All motion inside a shaded area is ignored, including people and vehicles.</p>
+    <div class="zone-stage"><img id="zoneImage" alt="Live camera view"><canvas id="zoneCanvas" width="1000" height="1000" aria-label="Draw exclusion rectangles on the live camera image"></canvas></div>
+    <div id="zoneStatus" class="status" role="status"></div>
+    <div class="actions"><button id="zoneUndo" type="button" class="secondary">Undo last</button><button id="zoneClear" type="button" class="secondary">Clear all</button><button id="zoneCancel" type="button" class="secondary">Cancel</button><button id="zoneSave" type="button">Save areas</button></div>
+  </dialog>
 
   <section class="logs-section">
     <div class="logs-head">
@@ -1231,13 +1114,11 @@ INDEX_HTML = r"""<!doctype html>
     const state = {
       streams: [],
       sensitivities: {},
-      motionUploads: {},
+      algorithms: {},
       previews: new Map(),
       mediaItems: [],
       mediaFolders: [
-        { key: "clips", label: "Clips", type: "video" },
-        { key: "debug_frames", label: "Debug Frames", type: "image" },
-        { key: "scenario_frames", label: "Scenario Frames", type: "image" }
+        { key: "clips", label: "Clips", type: "video" }
       ],
       activeMediaFolder: "clips",
       defaults: null
@@ -1260,12 +1141,9 @@ INDEX_HTML = r"""<!doctype html>
     function saveState() {
       const saved = {
         settings: settings(),
-        target_objects: targetObjects(),
         streams: state.streams,
         sensitivities: state.sensitivities,
-        motion_uploads: state.motionUploads,
-        model_filename: modelFilename(),
-        video_sensitivity: $("videoSensitivity").value || "5"
+        algorithms: state.algorithms
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
     }
@@ -1279,14 +1157,6 @@ INDEX_HTML = r"""<!doctype html>
       $("rtspTemplate").value = savedSettings.rtsp_path_template || "/Streaming/Channels/{channel}";
     }
 
-    function applySavedTargets(savedTargets) {
-      if (!Array.isArray(savedTargets) || !savedTargets.length) return;
-      const selected = new Set(savedTargets);
-      for (const checkbox of document.querySelectorAll("[data-target-object]")) {
-        checkbox.checked = selected.has(checkbox.value);
-      }
-    }
-
     function settings() {
       return {
         username: $("username").value.trim(),
@@ -1295,36 +1165,6 @@ INDEX_HTML = r"""<!doctype html>
         port: $("port").value.trim(),
         rtsp_path_template: $("rtspTemplate").value.trim()
       };
-    }
-
-    function targetObjects() {
-      return Array.from(document.querySelectorAll("[data-target-object]:checked")).map((box) => box.value);
-    }
-
-    function modelFilename() {
-      return $("modelSelect").value || (state.defaults && state.defaults.default_yolo_model) || "";
-    }
-
-    function renderTargetObjects(objects, defaults) {
-      $("targetObjects").innerHTML = objects.map((objectName) => `
-        <label>
-          <input type="checkbox" value="${objectName}" data-target-object ${defaults.includes(objectName) ? "checked" : ""}>
-          ${titleCase(objectName)}
-        </label>
-      `).join("");
-    }
-
-    function renderModelOptions(models, selectedModel) {
-      const options = Array.isArray(models) ? models : [];
-      $("modelSelect").innerHTML = options.map((model) => `
-        <option value="${escapeAttribute(model.filename)}" ${model.filename === selectedModel ? "selected" : ""}>
-          ${escapeHtml(model.label || model.filename)}
-        </option>
-      `).join("");
-    }
-
-    function titleCase(value) {
-      return value.charAt(0).toUpperCase() + value.slice(1);
     }
 
     function renderStreams() {
@@ -1343,7 +1183,10 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div class="stream-controls">
               <input id="sensitivity-${index}" data-sensitivity-id="${escapeAttribute(stream.stream_id)}" type="number" min="1" max="10" value="${state.sensitivities[stream.stream_id] || 5}" title="Sensitivity">
-              <label title="Motion-only capture: upload to motion/ without object detection, scenario or Gemma analysis. Applies when starting the camera."><input id="motion-upload-${index}" data-motion-upload-id="${escapeAttribute(stream.stream_id)}" type="checkbox" ${(state.motionUploads[stream.stream_id] ?? state.defaults?.default_upload_on_motion ?? false) ? "checked" : ""}> Upload clips on motion</label>
+              <select id="algorithm-${index}" data-algorithm-id="${escapeAttribute(stream.stream_id)}" title="Motion detection method">
+                <option value="difference" ${(state.algorithms[stream.stream_id] || "difference") === "difference" ? "selected" : ""}>Frame difference (test)</option>
+                <option value="background" ${state.algorithms[stream.stream_id] === "background" ? "selected" : ""}>Original background</option>
+              </select>
               <button data-start-index="${index}">Start</button>
             </div>
           </div>
@@ -1351,13 +1194,19 @@ INDEX_HTML = r"""<!doctype html>
       `).join("");
     }
 
-    function addPreview(sourceId, label, previewEnabled = true) {
+    function addPreview(sourceId, label, previewEnabled = true, excludedAreas = [], recording = false, status = "", objectRecording = false, objectStatus = "disabled", sensitivity = null) {
       const existing = state.previews.get(sourceId);
       if (existing) {
         existing.label = label;
         existing.previewEnabled = previewEnabled;
+        existing.excludedAreas = excludedAreas;
+        existing.recording = recording;
+        existing.status = status;
+        existing.objectRecording = objectRecording;
+        existing.objectStatus = objectStatus;
+        existing.sensitivity = sensitivity;
       } else {
-        state.previews.set(sourceId, { sourceId, label, previewEnabled });
+        state.previews.set(sourceId, { sourceId, label, previewEnabled, excludedAreas, recording, status, objectRecording, objectStatus, sensitivity });
       }
       renderPreviews();
     }
@@ -1382,9 +1231,13 @@ INDEX_HTML = r"""<!doctype html>
               <button class="secondary" data-preview-id="${encodeURIComponent(preview.sourceId)}" data-preview-enabled="${preview.previewEnabled ? "0" : "1"}">
                 ${preview.previewEnabled ? "Hide Preview" : "Show Preview"}
               </button>
+              ${preview.previewEnabled ? `<button class="secondary" data-zone-id="${encodeURIComponent(preview.sourceId)}">Draw excluded areas</button>` : ""}
               <button class="danger" data-stop-id="${encodeURIComponent(preview.sourceId)}">Stop</button>
             </div>
           </div>
+          <div class="recording-indicator ${preview.recording ? "active" : ""}" role="status">${preview.recording ? "Recording motion" : (preview.status && preview.status.toLowerCase().includes("paused") ? escapeHtml(preview.status) : "Not recording")}</div>
+          <div class="stream-meta">Motion sensitivity: ${preview.sensitivity == null ? "starting" : `${escapeHtml(String(preview.sensitivity))} / 10`}</div>
+          <div class="recording-indicator ${preview.objectRecording ? "active" : ""}" role="status">${preview.objectRecording ? "Recording object" : (preview.objectStatus === "ready" ? "Object recording idle" : `Object detection: ${escapeHtml(preview.objectStatus)}`)}</div>
           ${preview.previewEnabled
             ? `<img src="/preview/${encodeURIComponent(preview.sourceId)}" alt="">`
             : `<div class="preview-placeholder">Preview disabled<br>Detection is still running.</div>`}
@@ -1478,13 +1331,9 @@ INDEX_HTML = r"""<!doctype html>
       state.defaults = defaults;
       applySettings(defaults.settings);
       applySettings(saved.settings);
-      $("videoSensitivity").value = saved.video_sensitivity || defaults.default_motion_sensitivity || 5;
-      renderTargetObjects(defaults.available_target_objects, defaults.default_target_objects);
-      applySavedTargets(saved.target_objects);
-      renderModelOptions(defaults.available_yolo_models, saved.model_filename || defaults.default_yolo_model);
       if (Array.isArray(saved.streams)) state.streams = saved.streams;
       state.sensitivities = saved.sensitivities || {};
-      state.motionUploads = saved.motion_uploads || {};
+      state.algorithms = saved.algorithms || {};
       renderStreams();
       renderPreviews();
       await pollWorkers();
@@ -1538,16 +1387,15 @@ INDEX_HTML = r"""<!doctype html>
       const stream = state.streams[index];
       const sensitivity = Number($(`sensitivity-${index}`).value || 5);
       state.sensitivities[stream.stream_id] = sensitivity;
-      state.motionUploads[stream.stream_id] = $(`motion-upload-${index}`).checked;
       saveState();
       try {
+        state.algorithms[stream.stream_id] = $(`algorithm-${index}`).value;
+        saveState();
         const data = await jsonFetch("/api/stream/start", {
           settings: settings(),
           stream,
-          target_objects: targetObjects(),
           sensitivity,
-          upload_on_motion: state.motionUploads[stream.stream_id],
-          model_filename: modelFilename()
+          motion_algorithm: state.algorithms[stream.stream_id]
         });
         addPreview(data.worker.source_id, data.worker.label);
         setStatus("Running");
@@ -1556,6 +1404,94 @@ INDEX_HTML = r"""<!doctype html>
         setStatus("Error");
       }
     }
+
+    let zoneCamera = null;
+    let zoneAreas = [];
+    let zoneStart = null;
+    let zoneCurrent = null;
+
+    function zonePoint(event) {
+      const bounds = $("zoneCanvas").getBoundingClientRect();
+      return [Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+              Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height))];
+    }
+
+    function drawZones() {
+      const canvas = $("zoneCanvas"), ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const draw = (area, draft = false) => {
+        const [x,y,w,h] = area;
+        ctx.fillStyle = draft ? "rgba(255, 190, 30, .35)" : "rgba(225, 48, 48, .35)";
+        ctx.strokeStyle = draft ? "#ffbd1a" : "#ff4747";
+        ctx.lineWidth = 4;
+        ctx.fillRect(x*canvas.width, y*canvas.height, w*canvas.width, h*canvas.height);
+        ctx.strokeRect(x*canvas.width, y*canvas.height, w*canvas.width, h*canvas.height);
+      };
+      zoneAreas.forEach((area) => draw(area));
+      if (zoneStart && zoneCurrent) draw(zoneRectangle(zoneStart, zoneCurrent), true);
+      $("zoneStatus").textContent = `${zoneAreas.length} area(s) selected. Save to apply.`;
+    }
+
+    function zoneRectangle(a, b) {
+      return [Math.min(a[0],b[0]), Math.min(a[1],b[1]), Math.abs(a[0]-b[0]), Math.abs(a[1]-b[1])];
+    }
+
+    function openZoneEditor(sourceId) {
+      const preview = state.previews.get(sourceId);
+      if (!preview || !preview.previewEnabled) return;
+      zoneCamera = sourceId;
+      zoneAreas = (preview.excludedAreas || []).map((area) => [...area]);
+      zoneStart = zoneCurrent = null;
+      $("zoneTitle").textContent = `Excluded areas — ${preview.label}`;
+      $("zoneImage").src = `/preview/${encodeURIComponent(sourceId)}`;
+      $("zoneDialog").showModal();
+      drawZones();
+    }
+
+    function closeZoneEditor() {
+      $("zoneDialog").close();
+      $("zoneImage").removeAttribute("src");
+      zoneCamera = null;
+    }
+
+    $("zoneCanvas").addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || !$("zoneImage").naturalWidth) return;
+      event.preventDefault();
+      zoneStart = zoneCurrent = zonePoint(event);
+      event.currentTarget.setPointerCapture(event.pointerId);
+      drawZones();
+    });
+    $("zoneCanvas").addEventListener("pointermove", (event) => {
+      if (!zoneStart) return;
+      zoneCurrent = zonePoint(event);
+      drawZones();
+    });
+    $("zoneCanvas").addEventListener("pointerup", (event) => {
+      if (!zoneStart) return;
+      const area = zoneRectangle(zoneStart, zonePoint(event));
+      zoneStart = zoneCurrent = null;
+      if (area[2] >= .005 && area[3] >= .005 && zoneAreas.length < 20) zoneAreas.push(area);
+      drawZones();
+    });
+    $("zoneCanvas").addEventListener("pointercancel", () => { zoneStart = zoneCurrent = null; drawZones(); });
+    $("zoneUndo").addEventListener("click", () => { zoneAreas.pop(); drawZones(); });
+    $("zoneClear").addEventListener("click", () => { zoneAreas = []; drawZones(); });
+    $("zoneCancel").addEventListener("click", closeZoneEditor);
+    $("zoneDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeZoneEditor(); });
+    $("zoneSave").addEventListener("click", async () => {
+      if (!zoneCamera) return;
+      $("zoneSave").disabled = true;
+      try {
+        const data = await jsonFetch("/api/stream/exclusions", {source_id:zoneCamera, excluded_areas:zoneAreas});
+        const preview = state.previews.get(zoneCamera);
+        if (preview) preview.excludedAreas = data.excluded_areas;
+        closeZoneEditor();
+      } catch (error) {
+        $("zoneStatus").textContent = error.message;
+      } finally {
+        $("zoneSave").disabled = false;
+      }
+    });
 
     async function stopSource(sourceId) {
       await jsonFetch("/api/stream/stop", { source_id: sourceId });
@@ -1583,45 +1519,13 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    async function uploadVideo() {
-      const file = $("videoFile").files[0];
-      if (!file) {
-        $("scanStatus").textContent = "Choose a video clip first.";
-        return;
-      }
-      $("uploadButton").disabled = true;
-      setStatus("Uploading");
-      try {
-        const params = new URLSearchParams();
-        params.set("filename", file.name);
-        params.set("sensitivity", $("videoSensitivity").value || "5");
-        params.set("model", modelFilename());
-        for (const target of targetObjects()) params.append("targets", target);
-        const response = await fetch(`/api/video/start?${params.toString()}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/octet-stream" },
-          body: file
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || response.statusText);
-        addPreview(data.worker.source_id, data.worker.label);
-        $("scanStatus").textContent = `Uploaded ${file.name}. Annotation started.`;
-        setStatus("Running");
-      } catch (error) {
-        $("scanStatus").textContent = error.message;
-        setStatus("Error");
-      } finally {
-        $("uploadButton").disabled = false;
-      }
-    }
-
     async function pollWorkers() {
       try {
         const response = await fetch("/api/workers");
         const data = await response.json();
         const activeIds = new Set(data.workers.map((worker) => worker.source_id));
         for (const worker of data.workers) {
-          addPreview(worker.source_id, worker.label, worker.preview_enabled);
+          addPreview(worker.source_id, worker.label, worker.preview_enabled, worker.excluded_areas || [], worker.recording, worker.status, worker.object_recording, worker.object_detection_status, worker.sensitivity);
         }
         for (const sourceId of Array.from(state.previews.keys())) {
           if (!activeIds.has(sourceId)) state.previews.delete(sourceId);
@@ -1668,7 +1572,6 @@ INDEX_HTML = r"""<!doctype html>
 
     $("scanButton").addEventListener("click", scanStreams);
     $("manualButton").addEventListener("click", addManualChannel);
-    $("uploadButton").addEventListener("click", uploadVideo);
     $("refreshLogsButton").addEventListener("click", loadLogs);
     $("refreshClipsButton").addEventListener("click", () => loadMedia());
     document.addEventListener("input", (event) => {
@@ -1679,8 +1582,7 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
     document.addEventListener("change", (event) => {
-      const motionStreamId = event.target.dataset.motionUploadId;
-      if (motionStreamId) state.motionUploads[motionStreamId] = event.target.checked;
+      if (event.target.dataset.algorithmId) state.algorithms[event.target.dataset.algorithmId] = event.target.value;
       if (event.target.matches("input, select")) saveState();
     });
     document.addEventListener("click", (event) => {
@@ -1689,10 +1591,12 @@ INDEX_HTML = r"""<!doctype html>
       const previewId = event.target.dataset.previewId;
       const previewEnabled = event.target.dataset.previewEnabled;
       const mediaFolder = event.target.dataset.mediaFolder;
+      const zoneId = event.target.dataset.zoneId;
       if (startIndex !== undefined) startStream(Number(startIndex));
       if (stopId !== undefined) stopSource(decodeURIComponent(stopId));
       if (previewId !== undefined) setPreviewEnabled(decodeURIComponent(previewId), previewEnabled === "1");
       if (mediaFolder !== undefined) loadMedia(mediaFolder);
+      if (zoneId !== undefined) openZoneEditor(decodeURIComponent(zoneId));
     });
 
     loadDefaults();

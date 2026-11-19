@@ -1,2 +1,2 @@
-ultralytics==8.4.61
-urllib3<2
+# OpenCV provides the motion detector, RTSP decoding, and video writer.
+opencv-python-headless==4.13.0.92
