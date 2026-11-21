@@ -47,6 +47,21 @@ class MotionWebTests(unittest.TestCase):
             self.assertEqual(items[old.name]['detection_title'], 'Object detection not recorded')
             self.assertEqual(items[new.name]['evidence'][0]['url'], '/media/detection_frames/evidence.jpg')
 
+    def test_media_exposes_alert_decision_reasons(self):
+        from motion_clip_metadata import start_metadata, update_metadata, finish_metadata
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); clip=root/'motion_test.mp4'; clip.touch()
+            start_metadata(clip)
+            update_metadata(clip,['car'],alerts=[{'label':'car','reason':'vehicle moved'}],decisions=['stationary vehicle present during baseline'],
+                            associations=[{'label':'car','status':'associated','motion_samples':3,'matching_samples':2}])
+            finish_metadata(clip)
+            folders={'clips':{'path':root,'extensions':{'.mp4'},'type':'video'}}
+            with patch.object(webapp,'MEDIA_FOLDERS',folders),patch.object(webapp,'OBJECT_OUTPUT_DIR',root):
+                item=webapp.list_saved_media('clips')[0]
+            self.assertEqual(item['alert_reasons'],['vehicle moved'])
+            self.assertEqual(item['alert_decisions'],['stationary vehicle present during baseline'])
+            self.assertEqual(item['motion_associations'][0]['status'],'associated')
+
     def test_worker_summary_reports_active_recording(self):
         state = webapp.WebAppState()
         worker = webapp.WorkerState('camera:1', 'Camera 1', MagicMock(), MagicMock(), 'camera')

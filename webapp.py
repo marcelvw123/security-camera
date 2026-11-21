@@ -132,7 +132,7 @@ MEDIA_FOLDERS = {
 OBJECT_DETECTOR = None
 if os.getenv("OBJECT_DETECTION_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
     from object_detection import SharedObjectDetector
-    OBJECT_DETECTOR = SharedObjectDetector(Path(__file__).resolve().parent / 'models' / 'yolo11n.pt')
+    OBJECT_DETECTOR = SharedObjectDetector(Path(__file__).resolve().parent / 'models' / 'yolo11n.pt', interval=.5)
 
 
 @dataclass
@@ -422,6 +422,10 @@ def list_saved_media(folder_key, limit=80):
             {
                 "name": path.name,
                 "detection_title": title_for_metadata(metadata) if folder_key == 'clips' else None,
+                "alert_reasons": sorted({str(event.get('reason')) for event in (metadata or {}).get('alert_events', []) if isinstance(event, dict) and event.get('reason')}),
+                "alert_decisions": sorted({str(reason) for reason in (metadata or {}).get('alert_decisions', []) if isinstance(reason, str)}),
+                "motion_associations": (metadata or {}).get('motion_associations', []),
+                "crop_comparisons": (metadata or {}).get('crop_comparisons', []),
                 "evidence": evidence,
                 "size": stat.st_size,
                 "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
@@ -796,6 +800,8 @@ INDEX_HTML = r"""<!doctype html>
       padding: 14px;
     }
     section {
+      min-width: 0;
+      max-width: 100%;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -878,6 +884,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .stack {
       display: grid;
+      min-width: 0;
       gap: 14px;
     }
     .status {
@@ -906,6 +913,7 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
     .stream-item, .preview-item {
+      min-width: 0;
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 9px;
@@ -963,7 +971,7 @@ INDEX_HTML = r"""<!doctype html>
       background: #101820;
       border-radius: 6px;
     }
-    dialog.zone-dialog { width: min(96vw, 1000px); max-height: 94vh; border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+    dialog.zone-dialog { width: min(calc(100vw - 24px), 1000px); max-width: calc(100vw - 24px); max-height: 94vh; border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
     dialog.zone-dialog::backdrop { background: rgba(0,0,0,.65); }
     .zone-stage { position: relative; width: fit-content; max-width: 100%; margin: auto; line-height: 0; background: #101820; }
     .zone-stage img { width: auto; height: auto; max-width: 100%; max-height: calc(100vh - 240px); display: block; }
@@ -1012,6 +1020,7 @@ INDEX_HTML = r"""<!doctype html>
       padding-right: 4px;
     }
     .clip-item {
+      min-width: 0;
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 9px;
@@ -1026,6 +1035,7 @@ INDEX_HTML = r"""<!doctype html>
       margin: 4px 0 8px;
       color: var(--muted);
       font-size: 11px;
+      overflow-wrap: anywhere;
     }
     .clip-item video {
       display: block;
@@ -1090,6 +1100,7 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
       gap: 10px;
       margin-bottom: 10px;
     }
@@ -1098,6 +1109,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .logs-actions {
       display: flex;
+      flex-wrap: wrap;
       gap: 8px;
       align-items: center;
     }
@@ -1364,6 +1376,17 @@ INDEX_HTML = r"""<!doctype html>
       `).join("");
     }
 
+    function motionGateSummary(comparisons) {
+      const checks = Array.isArray(comparisons) ? comparisons : [];
+      if (!checks.length) return '';
+      const errors = checks.filter(c => c.error).length;
+      const passed = checks.filter(c => (c.moving_gate || []).some(d => d.qualified));
+      const labels = [...new Set(passed.flatMap(c => (c.moving_gate || [])
+        .filter(d => d.qualified).map(d => d.label).filter(Boolean)))];
+      const result = passed.length ? `${passed.length} passed${labels.length ? ` (${labels.join(', ')})` : ''}` : 'none passed';
+      return `${checks.length} recent ${checks.length === 1 ? 'check' : 'checks'} · ${result}${errors ? ` · ${errors} ${errors === 1 ? 'error' : 'errors'}` : ''}`;
+    }
+
     function renderMedia() {
       const list = $("clipList");
       renderMediaTabs();
@@ -1376,6 +1399,10 @@ INDEX_HTML = r"""<!doctype html>
         <div class="clip-item">
           <div class="clip-title">${escapeHtml(item.name)}${item.detection_title ? ` — ${escapeHtml(item.detection_title)}` : ''}</div>
           <div class="clip-meta">${escapeHtml(formatDateTime(item.modified))} · ${escapeHtml(formatBytes(item.size))}</div>
+          ${(item.alert_reasons || []).length ? `<div class="clip-meta">Alert eligible: ${escapeHtml(item.alert_reasons.join('; '))}</div>` : ''}
+          ${(item.alert_decisions || []).length ? `<div class="clip-meta">Detection checks: ${escapeHtml(item.alert_decisions.join('; '))}</div>` : ''}
+          ${(item.motion_associations || []).length ? `<div class="clip-meta">Motion association (test only): ${escapeHtml([...new Set(item.motion_associations.map(a => `${a.label}: ${a.status}`))].join('; '))}</div>` : ''}
+          ${(item.crop_comparisons || []).length ? `<div class="clip-meta">Motion gate: ${escapeHtml(motionGateSummary(item.crop_comparisons))}</div>` : ''}
           ${mediaPreviewHtml(item)}
           <div class="clip-actions">
             <a href="${escapeAttribute(item.url)}" download>Download</a>

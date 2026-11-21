@@ -9,7 +9,7 @@ from motion_clip_metadata import start_metadata, update_metadata
 
 
 class ObjectAlertTests(unittest.TestCase):
-    def test_only_detected_objects_queue_an_alert(self):
+    def test_motion_clip_does_not_queue_a_duplicate_alert(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.dict('os.environ', {'WHATSAPP_OBJECT_ALERTS_ENABLED': 'true'}), \
              patch('object_alerts.queue_object_alert') as queue_alert:
@@ -18,9 +18,18 @@ class ObjectAlertTests(unittest.TestCase):
             core.finalize_recorded_clip(empty, 'Camera 801', None, upload_on_motion=True)
             queue_alert.assert_not_called()
             detected = Path(directory) / 'detected.mp4'
-            start_metadata(detected); update_metadata(detected, ['car'], 'car.jpg')
+            start_metadata(detected); update_metadata(detected, ['car'], 'car.jpg', alerts=[{'label':'car','reason':'vehicle moved'}])
             core.finalize_recorded_clip(detected, 'Camera 801', None, upload_on_motion=True)
-            queue_alert.assert_called_once_with(detected, 'Camera 801', ['car'])
+            queue_alert.assert_not_called()
+
+    def test_raw_detection_alone_does_not_send_an_alert(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict('os.environ', {'WHATSAPP_OBJECT_ALERTS_ENABLED': 'true'}), \
+             patch('object_alerts.queue_object_alert') as queue_alert:
+            clip = Path(directory) / 'stationary.mp4'
+            start_metadata(clip); update_metadata(clip, ['bus'], 'bus.jpg', decisions=['stationary vehicle present during baseline'])
+            core.finalize_recorded_clip(clip, 'Camera 701', None, upload_on_motion=True)
+            queue_alert.assert_not_called()
 
     def test_disabled_alerts_never_queue(self):
         with tempfile.TemporaryDirectory() as directory, \

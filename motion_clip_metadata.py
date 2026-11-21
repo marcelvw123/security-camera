@@ -40,12 +40,24 @@ def start_metadata(clip_path):
     write_metadata(clip_path, {'version': 1, 'recording': True, 'samples': 0, 'objects': []})
 
 
-def update_metadata(clip_path, labels, evidence=None):
+def update_metadata(clip_path, labels, evidence=None, alerts=None, decisions=None, associations=None, crop_comparison=None):
     data = load_metadata(clip_path)
     if data is None or not data.get('recording'):
         return
     data['samples'] += 1
     data['objects'] = sorted(set(data['objects']) | {str(label) for label in labels if label})
+    if alerts:
+        data.setdefault('alert_events', []).extend(alerts)
+        data['alert_objects'] = sorted(set(data.get('alert_objects', [])) | {event['label'] for event in alerts})
+    if decisions:
+        data.setdefault('alert_decisions', []).extend(decisions)
+        data['alert_decisions'] = data['alert_decisions'][-100:]
+    if associations:
+        data.setdefault('motion_associations', []).extend(associations)
+        data['motion_associations'] = data['motion_associations'][-100:]
+    if crop_comparison is not None:
+        data.setdefault('crop_comparisons', []).append(crop_comparison)
+        data['crop_comparisons'] = data['crop_comparisons'][-100:]
     if labels:
         if evidence:
             name = Path(evidence).name

@@ -710,10 +710,6 @@ def finalize_recorded_clip(
     recorded_clip_path = Path(clip_path)
     if upload_on_motion:
         finish_metadata(recorded_clip_path)
-        metadata = load_metadata(recorded_clip_path)
-        if bool_env('WHATSAPP_OBJECT_ALERTS_ENABLED', False) and metadata and metadata.get('objects'):
-            from object_alerts import queue_object_alert
-            queue_object_alert(recorded_clip_path, source_name, metadata['objects'])
         # Motion-only mode keeps raw recordings local for independent review.
         status_callback(f"Motion clip saved: {recorded_clip_path.name}")
         analysis_callback(recorded_clip_path.name, "Motion clip saved locally", 100)
@@ -1206,11 +1202,12 @@ def run_detection(
     motion_ready_at = float("inf")
     preroll = MotionPreRoll(seconds=MOTION_PREROLL_SECONDS)
     object_recorder = None
+    pending_alerts = []
     if object_detector is not None:
         from object_detection import ObjectClipRecorder
         object_recorder = ObjectClipRecorder(object_detector, object_source_id or window_title, OBJECT_OUTPUT_DIR,
             create_video_writer, object_status_callback or (lambda _recording: None), preroll,
-            MOTION_MIN_FREE_MB * 1024 * 1024)
+            MOTION_MIN_FREE_MB * 1024 * 1024, alert_camera=window_title)
     shadow = MotionShadowComparison(window_title) if MOTION_SHADOW_ENABLED else None
     storage_warning_at = 0.0
     next_recording_space_check = 0.0
@@ -1235,6 +1232,11 @@ def run_detection(
                 # A new stream needs a fresh background, including after reconnect.
                 motion_detector = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
                 preroll.clear()
+                if object_recorder is not None:
+                    object_recorder.motion_association.clear()
+                    object_recorder.moving_object_gate.clear()
+                    object_recorder.weak_motion_vehicle.clear()
+                    object_recorder.detector.remove(object_recorder.camera)
                 if difference is not None:
                     difference.reset()
                 if shadow is not None:
@@ -1371,6 +1373,7 @@ def run_detection(
             skip_detection_for_recording = False
             detection_due = DETECTION_INTERVAL_SECONDS <= 0 or loop_now >= next_detection_time
             motion_boxes = []
+            motion_pair = None
             motion_detected = False
             matched_objects = set()
             relevant_objects = set()
@@ -1389,13 +1392,17 @@ def run_detection(
                 if difference is not None:
                     try:
                         primed = (difference.previous_time is not None and 0 < loop_now - difference.previous_time <= difference.max_gap_seconds)
+                        previous_motion_frame, previous_motion_time = difference.previous, difference.previous_time
                         candidate_boxes = difference.observe(frame, loop_now)
                         if primed:
                             motion_boxes = candidate_boxes
+                            motion_pair = (previous_motion_frame, difference.previous, loop_now - previous_motion_time)
                     except Exception:
                         logging.exception('Frame difference failed for %s; falling back to background detection', window_title)
                         difference = None
                 motion_detected = bool(motion_boxes) and loop_now >= motion_ready_at
+                if object_recorder is not None and loop_now >= motion_ready_at:
+                    object_recorder.motion_association.add(loop_now, motion_boxes, frame.shape[1], frame.shape[0])
                 if writer is not None and motion_detected:
                     clip_end_time = max(clip_end_time, loop_now + MOTION_QUIET_SECONDS)
                 if shadow is not None:
@@ -1568,15 +1575,23 @@ def run_detection(
 
             if object_recorder is not None:
                 try:
-                    checks = object_recorder.observe(frame, loop_now, bool(writer is not None or motion_detected))
+                    checks = object_recorder.observe(frame, loop_now, bool(writer is not None or motion_detected), motion_boxes if motion_detected else None, motion_pair if motion_detected else None)
                     if object_result_callback:
-                        for _sampled_at, labels, _evidence in checks:
+                        for _sampled_at, labels, _evidence, _events, _decisions, _source, _associations, _crop_result in checks:
                             if labels:
                                 object_result_callback(labels)
-                    if active_clip_path is not None and upload_on_motion:
-                        for sampled_at, labels, evidence in checks:
-                            if sampled_at >= clip_detection_start:
-                                update_metadata(active_clip_path, labels, evidence)
+                    pending_alerts = [(t, event) for t, event in pending_alerts if loop_now-t <= 15]
+                    for sampled_at, labels, evidence, events, decisions, source, associations, crop_result in checks:
+                        if active_clip_path is not None and upload_on_motion and sampled_at >= clip_detection_start:
+                            diagnostic = [{**item, 'source': source, 'seconds_after_trigger': round(sampled_at-clip_detection_start, 1)} for item in associations]
+                            comparison = None if crop_result is None else {**crop_result, 'full_frame_labels': labels, 'seconds_after_trigger': round(sampled_at-clip_detection_start, 1)}
+                            update_metadata(active_clip_path, labels, evidence, events, decisions, diagnostic, comparison)
+                        else:
+                            pending_alerts.extend((sampled_at, event) for event in events)
+                    if active_clip_path is not None and upload_on_motion and pending_alerts:
+                        update_metadata(active_clip_path, [], alerts=[event for _t, event in pending_alerts],
+                                        decisions=['alert carried into next motion clip'])
+                        pending_alerts = []
                 except Exception:
                     logging.exception('Object clip processing failed for %s', window_title)
                     try:

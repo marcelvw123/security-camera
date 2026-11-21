@@ -6,6 +6,7 @@ import time
 import os
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 
 VEHICLES = {'car', 'motorcycle', 'bus', 'truck'}
@@ -81,28 +82,32 @@ class SharedObjectDetector:
     """At most one pending frame per camera; inference never blocks capture."""
     def __init__(self, model_path, interval=1.0):
         self.model_path = Path(model_path)
+        self.weak_model_path = os.getenv('WEAK_MOTION_MODEL', '').strip()
         self.interval = interval
         self.condition = threading.Condition()
         self.pending = OrderedDict()
         self.results = {}
         self.last_submitted = {}
+        self.last_crop_submitted = {}
         self.generations = {}
         self.processing_camera = None
         self.status = 'starting'
-        token_file = os.getenv('REMOTE_VEHICLE_TOKEN_FILE', '').strip()
-        local_model = os.getenv('LOCAL_VEHICLE_MODEL', '').strip()
-        self.remote_shadow = LocalVehicleVerifier(local_model) if local_model else (RemoteVehicleShadow(token_file) if token_file else None)
+        # All inference belongs to this app and follows the motion-crop gate.
+        self.remote_shadow = None
         self.thread = threading.Thread(target=self._run, daemon=True, name='object-inference')
         self.thread.start()
 
-    def submit(self, camera, frame, timestamp):
-        if self.remote_shadow:
-            self.remote_shadow.submit(camera, frame, timestamp)
+    def submit(self, camera, frame, timestamp, motion_boxes=None, motion_pair=None):
+        from motion_crop import select_motion_crop
+        crop = select_motion_crop(motion_boxes, frame.shape[1], frame.shape[0])
+        if crop is None:
+            return
         with self.condition:
             if self.status == 'error' or timestamp - self.last_submitted.get(camera, -float('inf')) < self.interval:
                 return
             self.last_submitted[camera] = timestamp
-            self.pending[camera] = (frame.copy(), timestamp, self.generations.get(camera, 0))
+            self.pending[camera] = (frame.copy(), timestamp, self.generations.get(camera, 0), crop,
+                                    list(motion_boxes), motion_pair, datetime.now(timezone.utc).isoformat())
             self.condition.notify()
 
     def take(self, camera):
@@ -116,6 +121,7 @@ class SharedObjectDetector:
             self.pending.pop(camera, None)
             self.results.pop(camera, None)
             self.last_submitted.pop(camera, None)
+            self.last_crop_submitted.pop(camera, None)
             self.generations[camera] = self.generations.get(camera, 0) + 1
 
     def take_remote(self, camera):
@@ -134,31 +140,68 @@ class SharedObjectDetector:
         try:
             import torch
             from ultralytics import YOLO
-            if not os.getenv('LOCAL_VEHICLE_MODEL', '').strip():
-                torch.set_num_threads(1)
+            from moving_object_gate import MovingObjectGate
+            torch.set_num_threads(2)
             if not self.model_path.is_file():
                 raise FileNotFoundError('Object model file not found')
             model = YOLO(str(self.model_path))
+            gates = {}
             self.status = 'ready'
             while True:
                 with self.condition:
                     self.condition.wait_for(lambda: bool(self.pending))
-                    camera, (frame, timestamp, generation) = self.pending.popitem(last=False)
+                    camera, (frame, timestamp, generation, crop, regions, motion_pair, captured_at) = self.pending.popitem(last=False)
                     self.processing_camera = camera
-                result = model.predict(frame, classes=[0, 2, 3, 5, 7], conf=.35,
-                                       imgsz=640, device='cpu', verbose=False)[0]
-                detections = [(model.names[int(cls)], [float(v) for v in box], float(conf))
-                              for box, conf, cls in zip(result.boxes.xyxy, result.boxes.conf, result.boxes.cls)]
+                if camera not in gates or gates[camera][0] != generation:
+                    gates[camera] = (generation, MovingObjectGate())
+                try:
+                    detections, crop_result = process_motion_frame(
+                        model, frame, crop, regions, motion_pair, gates[camera][1], timestamp)
+                    crop_result['captured_at'] = captured_at
+                except Exception:
+                    logging.exception('Motion-gated detection failed for %s', camera)
+                    detections, crop_result = [], {'crop_box': list(crop), 'motion_regions': regions,
+                                                  'error': 'motion-gated inference failed'}
                 with self.condition:
                     self.processing_camera = None
                     if generation == self.generations.get(camera, 0):
-                        self.results[camera] = (timestamp, frame.shape[1], detections, frame if detections else None)
+                        self.results[camera] = (timestamp, frame.shape[1], detections,
+                                                frame if detections else None, crop_result)
         except Exception:
             logging.exception('Object detection stopped')
             with self.condition:
                 self.status = 'error'
                 self.processing_camera = None
                 self.pending.clear()
+
+
+def process_motion_frame(model, frame, crop, regions, motion_pair, gate, timestamp):
+    """Detect the motion crop first; run scene inference only after it qualifies."""
+    from motion_crop import detect_motion_crop, merge_scene_detections
+    from motion_flow import motion_flow_evidence
+    height, width = frame.shape[:2]
+    cropped = detect_motion_crop(model, frame, crop)
+    flows = None
+    if motion_pair is not None and cropped:
+        try:
+            flows = motion_flow_evidence(*motion_pair, [item['box'] for item in cropped], width, height)
+        except Exception:
+            logging.exception('Image motion calculation failed; using tracked observations')
+    gated = gate.observe(cropped, regions, timestamp, width, height, flows)
+    comparison = {'crop_box': list(crop), 'motion_regions': regions, 'detections': cropped,
+                  'flow_evidence': flows, 'moving_gate': gated}
+    qualified = [item for item in gated if item['qualified']]
+    if not qualified:
+        comparison['combined'] = []
+        comparison['full_frame_ran'] = False
+        return [], comparison
+    scene = model.predict(frame, classes=[0, 2, 3, 5, 7], conf=.35,
+                          imgsz=640, device='cpu', verbose=False)[0]
+    full = [{'label': model.names[int(cls)], 'box': [float(v) for v in box], 'confidence': float(conf)}
+            for box, conf, cls in zip(scene.boxes.xyxy, scene.boxes.conf, scene.boxes.cls)]
+    comparison['combined'] = merge_scene_detections(full, cropped)
+    comparison['full_frame_ran'] = True
+    return [(item['label'], item['box'], item['confidence']) for item in comparison['combined']], comparison
 
 class RemoteVehicleShadow:
     """Send only the latest sampled frame per camera through a local SSH tunnel."""
@@ -283,6 +326,10 @@ class LocalVehicleVerifier(RemoteVehicleShadow):
         with self.condition:
             return self.generations.get(camera, 0)
 
+    def current_crop(self, camera):
+        with self.condition:
+            return list(self.crops.get(camera, self.default_crop(camera)))
+
     def _run(self):
         try:
             import torch
@@ -324,47 +371,86 @@ class LocalVehicleVerifier(RemoteVehicleShadow):
 class ObjectClipRecorder:
     """Create one separate short clip for a confirmed event using capture frames."""
     def __init__(self, detector, camera, output_dir, writer_factory, status_callback, preroll,
-                 min_free_bytes, fps=10, seconds=20):
+                 min_free_bytes, fps=10, seconds=20, alert_camera=None):
         self.detector, self.camera = detector, camera
+        self.alert_camera = alert_camera or camera
         self.output_dir, self.writer_factory = Path(output_dir), writer_factory
         self.status_callback, self.min_free_bytes = status_callback, min_free_bytes
         self.fps, self.seconds = fps, seconds
         self.preroll = preroll
         self.gate = ObjectGate()
+        from alert_policy import AlertPolicy
+        self.alert_policy = AlertPolicy()
+        from motion_association import MotionAssociation
+        self.motion_association = MotionAssociation()
+        from moving_object_gate import MovingObjectGate
+        self.moving_object_gate = MovingObjectGate()
+        from weak_motion_vehicle import WeakMotionVehicle
+        self.weak_motion_vehicle = WeakMotionVehicle()
+        self.last_idle_submit = None
+        self.last_motion_event = {}
+        self.last_scenario_alert = {}
         self.vehicle_gate = VehicleDetectionGate()
         self.road_crop_revision = detector.vehicle_crop_revision(camera)
         self.writer = None
         self.end_time = self.next_frame = 0
         self.next_disk_check = 0
 
-    def observe(self, frame, now, motion_active):
+    def observe(self, frame, now, motion_active, motion_boxes=None, motion_pair=None):
         import shutil
         from datetime import datetime
         from motion_preroll import AsyncPreRollWriter
-        if motion_active or self.writer:
-            self.detector.submit(self.camera, frame, now)
+        # No object inference or baseline scan runs without a fresh motion crop.
+        if motion_boxes:
+            self.detector.submit(self.camera, frame, now, motion_boxes, motion_pair)
         result = self.detector.take(self.camera)
         found = []
         checked = []
-        evidence_checks = []
-        revision = self.detector.vehicle_crop_revision(self.camera)
-        if revision != self.road_crop_revision:
-            self.vehicle_gate = VehicleDetectionGate()
-            self.road_crop_revision = revision
         if result is not None and 0 <= now - result[0] <= 8:
-            labels = [d[0] for d in result[2]]
-            evidence_checks.append((result[0], labels, result[3] if len(result) > 3 else None,
-                                    [{'label': d[0], 'box': d[1], 'confidence': d[2]} for d in result[2]]))
-            found = self.gate.update(result[2], result[0], result[1])
-        remote = self.detector.take_remote(self.camera)
-        if remote is not None and 0 <= now - remote[0] <= 8:
-            evidence_checks.append((remote[0], [d.get('label') for d in remote[1]], remote[2] if len(remote) > 2 else None, remote[1]))
-        for timestamp, labels, captured, boxes in sorted(evidence_checks, key=lambda item: item[0]):
-            evidence = self.save_evidence(captured, boxes) if labels else None
-            checked.append((timestamp, labels, evidence))
-            if self.vehicle_gate.update(timestamp, labels):
-                found = sorted(set(found + ['vehicle']))
-        if found and self.writer is None:
+            timestamp, _width, detections = result[:3]
+            captured = result[3] if len(result) > 3 else None
+            crop_result = result[4] if len(result) > 4 else None
+            labels = [d[0] for d in detections]
+            boxes = [{'label': d[0], 'box': d[1], 'confidence': d[2]} for d in detections]
+            evidence = self.save_evidence(captured, boxes) if labels and (motion_active or self.writer) else None
+            height, width = (captured if captured is not None else frame).shape[:2]
+            associations = self.motion_association.check(boxes, timestamp, width, height)
+            decisions, events = [], []
+            qualified = [item for item in (crop_result or {}).get('moving_gate', []) if item.get('qualified')]
+            for item in qualified:
+                label = item.get('label')
+                category = 'vehicle' if label in VEHICLES else label
+                if category not in ('person', 'vehicle'):
+                    continue
+                quiet = 25 if category == 'vehicle' else 20
+                previous = self.last_motion_event.get(category)
+                if previous is not None and timestamp - previous < quiet:
+                    continue
+                self.last_motion_event[category] = timestamp
+                found.append(category)
+            # Scene rules are evaluated independently of the recording cooldown.
+            # A moving vehicle may reveal two people in the same full frame.
+            if qualified and (crop_result or {}).get('full_frame_ran'):
+                from notification_scenarios import evaluate_person_scenario
+                event = evaluate_person_scenario(boxes, crop_result.get('captured_at'))
+                if event:
+                    previous = self.last_scenario_alert.get(event['scenario'])
+                    if previous is None or timestamp - previous >= 20:
+                        self.last_scenario_alert[event['scenario']] = timestamp
+                        events.append(event)
+                    else:
+                        decisions.append('person scenario in cooldown')
+                else:
+                    decisions.append('no person notification scenario matched')
+            if crop_result and not qualified:
+                decisions.append('motion crop did not confirm a moving object')
+            for event in events:
+                logging.info('Alert event camera=%s source=motion_crop object=%s reason=%s',
+                             self.camera, event['label'], event['reason'])
+            checked.append((timestamp, labels, evidence, events, decisions, 'full', associations, crop_result))
+        if any(check[3] for check in checked) and not found:
+            found.append('person')
+        if found and self.writer is None and (motion_active or any(check[3] for check in checked)):
                 self.output_dir.mkdir(parents=True, exist_ok=True)
                 if shutil.disk_usage(self.output_dir).free >= self.min_free_bytes:
                     name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in self.camera)
@@ -382,9 +468,9 @@ class ObjectClipRecorder:
                     logging.warning('Object clip skipped: disk reserve reached')
         if self.writer:
             from motion_clip_metadata import update_metadata
-            for _timestamp, labels, evidence in checked:
-                if labels:
-                    update_metadata(self.writer.path, labels, evidence)
+            for _timestamp, labels, evidence, events, decisions, _source, _associations, _crop_result in checked:
+                if labels or events:
+                    update_metadata(self.writer.path, labels, evidence, alerts=events, decisions=decisions)
         if self.writer:
             if now >= self.next_disk_check:
                 self.next_disk_check = now + 5
@@ -449,13 +535,20 @@ class ObjectClipRecorder:
     def close(self):
         if self.writer:
             writer, self.writer = self.writer, None
+            saved = False
             try:
                 writer.release()
+                saved = True
                 logging.info('Object clip saved: %s', writer.path)
             finally:
-                from motion_clip_metadata import finish_metadata
+                from motion_clip_metadata import finish_metadata, load_metadata
                 finish_metadata(writer.path)
                 self.status_callback(False)
+            if saved and os.getenv('WHATSAPP_OBJECT_ALERTS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on'):
+                metadata = load_metadata(writer.path)
+                if metadata and metadata.get('alert_objects'):
+                    from object_alerts import queue_object_alert
+                    queue_object_alert(writer.path, self.alert_camera, metadata['alert_objects'])
 
     def stop(self):
         try:
