@@ -1260,15 +1260,24 @@ INDEX_HTML = r"""<!doctype html>
     }
     .clip-actions {
       display: flex;
+      flex-wrap: wrap;
+      min-width: 0;
       gap: 8px;
       margin-top: 8px;
     }
     .clip-actions a {
+      max-width: 100%;
+      overflow-wrap: anywhere;
       color: var(--accent-dark);
       font-size: 12px;
       font-weight: 650;
       text-decoration: none;
     }
+    .evidence-details { margin-top: 8px; min-width: 0; }
+    .evidence-details summary { color: var(--accent-dark); cursor: pointer; font-size: 12px; font-weight: 650; }
+    .media-more { display: flex; justify-content: center; margin-top: 12px; }
+    .media-more button { min-height: 30px; padding: 5px 14px; }
+    .media-more[hidden] { display: none; }
     .media-tabs {
       display: flex;
       flex-wrap: wrap;
@@ -1396,9 +1405,9 @@ INDEX_HTML = r"""<!doctype html>
           <h2>Saved Media</h2>
           <button id="refreshClipsButton" class="secondary">Refresh</button>
         </div>
-        <div class="clip-actions"><button id="mediaPrev" type="button">Previous archive page</button><span id="mediaPage">Page 1</span><button id="mediaNext" type="button">Next archive page</button></div>
         <div id="mediaTabs" class="media-tabs"></div>
         <div id="clipList" class="clip-list"></div>
+        <div id="mediaMore" class="media-more" hidden><button id="loadMoreMedia" class="secondary" type="button">Show more</button></div>
       </section>
     </div>
   </main>
@@ -1612,7 +1621,7 @@ INDEX_HTML = r"""<!doctype html>
             <a href="${escapeAttribute(item.url)}" download>Download</a>
             <a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer">Open</a>
           </div>
-          ${(item.evidence || []).length ? `<div class="clip-actions">${item.evidence.map((frame, index) => `<a href="${escapeAttribute(frame.url)}" target="_blank" rel="noreferrer">Detection image ${index + 1}</a>`).join('')}</div>` : ''}
+          ${(item.evidence || []).length ? `<details class="evidence-details"><summary>Detection images (${item.evidence.length})</summary><div class="clip-actions">${item.evidence.map((frame, index) => `<a href="${escapeAttribute(frame.url)}" target="_blank" rel="noreferrer">Detection image ${index + 1}</a>`).join('')}</div></details>` : ''}
         </div>
       `).join("");
     }
@@ -1993,22 +2002,29 @@ INDEX_HTML = r"""<!doctype html>
 
     async function loadMedia(folderKey = state.activeMediaFolder, page = 0) {
       state.activeMediaFolder = folderKey;
-      state.mediaPage = page;
+      $('loadMoreMedia').disabled = true;
       try {
-        const response = await fetch(`/api/media?folder=${encodeURIComponent(state.activeMediaFolder)}&page=${state.mediaPage}`);
+        const response = await fetch(`/api/media?folder=${encodeURIComponent(folderKey)}&page=${page}`);
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || response.statusText);
         state.mediaFolders = data.folders || state.mediaFolders;
-        state.mediaItems = data.items || [];
+        state.mediaPage = page;
+        const incoming = data.items || [];
+        if (page === 0) state.mediaItems = incoming;
+        else {
+          const seen = new Set(state.mediaItems.map(item => item.archive_id || item.url));
+          state.mediaItems.push(...incoming.filter(item => !seen.has(item.archive_id || item.url)));
+        }
         state.mediaHasMore = Boolean(data.has_more);
-        $('mediaPage').textContent = `Page ${state.mediaPage + 1}`;
-        $('mediaPrev').disabled = state.mediaPage === 0;
-        $('mediaNext').disabled = !state.mediaHasMore;
+        $('mediaMore').hidden = !state.mediaHasMore;
         renderMedia();
         if (data.archive_unavailable) $("clipList").insertAdjacentHTML('afterbegin', '<div class="status">Cloud archive is temporarily unavailable; showing local media.</div>');
       } catch (_error) {
         renderMediaTabs();
-        $("clipList").innerHTML = `<div class="status">Could not load saved media.</div>`;
+        if (page === 0) $("clipList").innerHTML = `<div class="status">Could not load saved media.</div>`;
+        else $("clipList").insertAdjacentHTML('beforeend', '<div class="status">Could not load more media. Please try again.</div>');
+      } finally {
+        $('loadMoreMedia').disabled = false;
       }
     }
 
@@ -2018,11 +2034,10 @@ INDEX_HTML = r"""<!doctype html>
       button.disabled = true;
       try {
         await jsonFetch('/api/archive/review', {media_id:button.dataset.reviewId, review:button.dataset.review, note:''});
-        await loadMedia(state.activeMediaFolder, state.mediaPage);
+        await loadMedia(state.activeMediaFolder);
       } catch (error) { alert(error.message); button.disabled = false; }
     });
-    $('mediaPrev').addEventListener('click', () => loadMedia(state.activeMediaFolder, Math.max(0, state.mediaPage - 1)));
-    $('mediaNext').addEventListener('click', () => { if (state.mediaHasMore) loadMedia(state.activeMediaFolder, state.mediaPage + 1); });
+    $('loadMoreMedia').addEventListener('click', () => { if (state.mediaHasMore) loadMedia(state.activeMediaFolder, state.mediaPage + 1); });
     $("scanButton").addEventListener("click", scanStreams);
     $("manualButton").addEventListener("click", addManualChannel);
     $("refreshLogsButton").addEventListener("click", loadLogs);
