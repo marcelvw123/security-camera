@@ -21,5 +21,5 @@ def archive_request(path, payload=None, config=None):
         return None
 
 
-def list_archive(kind):
-    return archive_request('/archive?' + urlencode({'kind': kind}))
+def list_archive(kind, offset=0):
+    return archive_request('/archive?' + urlencode({'kind': kind, 'offset': offset}))

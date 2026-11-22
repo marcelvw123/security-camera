@@ -514,9 +514,9 @@ def list_saved_media(folder_key, limit=80):
     return items[:limit]
 
 
-def list_archived_media(folder_key):
+def list_archived_media(folder_key, offset=0):
     kind = {"clips": "motion", "object_clips": "object", "detection_frames": "image"}[folder_key]
-    result = list_archive(kind)
+    result = list_archive(kind, offset)
     if result is None:
         return None
     items = []
@@ -643,8 +643,14 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             folder = media_folder_config(folder_key)
             if folder is None:
                 return self.send_json({"error": "Unknown media folder"}, HTTPStatus.BAD_REQUEST)
-            archived = list_archived_media(folder_key) if ARCHIVE_ENABLED else []
-            local_items = list_saved_media(folder_key)
+            try:
+                page = max(0, int(query.get("page", ["0"])[0]))
+                if page > 10000:
+                    raise ValueError("page out of range")
+            except ValueError:
+                return self.send_json({"error": "Invalid archive page"}, HTTPStatus.BAD_REQUEST)
+            archived = list_archived_media(folder_key, page * 100) if ARCHIVE_ENABLED else []
+            local_items = list_saved_media(folder_key) if page == 0 else []
             archived_names = {item['name'] for item in (archived or [])}
             combined = [item for item in local_items if item['name'] not in archived_names] + (archived or [])
             combined.sort(key=lambda item: item.get("modified", ""), reverse=True)
@@ -653,7 +659,8 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
                     "folder": folder_key,
                     "label": folder["label"],
                     "archive_unavailable": ARCHIVE_ENABLED and archived is None,
-                    "items": combined[:100],
+                    "page": page, "has_more": bool(archived and len(archived) == 100),
+                    "items": combined,
                     "folders": [
                         {"key": key, "label": config["label"], "type": config["type"]}
                         for key, config in MEDIA_FOLDERS.items()
@@ -1383,6 +1390,7 @@ INDEX_HTML = r"""<!doctype html>
           <h2>Saved Media</h2>
           <button id="refreshClipsButton" class="secondary">Refresh</button>
         </div>
+        <div class="clip-actions"><button id="mediaPrev" type="button">Previous archive page</button><span id="mediaPage">Page 1</span><button id="mediaNext" type="button">Next archive page</button></div>
         <div id="mediaTabs" class="media-tabs"></div>
         <div id="clipList" class="clip-list"></div>
       </section>
@@ -1416,6 +1424,8 @@ INDEX_HTML = r"""<!doctype html>
       algorithms: {},
       previews: new Map(),
       mediaItems: [],
+      mediaPage: 0,
+      mediaHasMore: false,
       mediaFolders: [
         { key: "clips", label: "Clips", type: "video" }
       ],
@@ -1975,14 +1985,19 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    async function loadMedia(folderKey = state.activeMediaFolder) {
+    async function loadMedia(folderKey = state.activeMediaFolder, page = 0) {
       state.activeMediaFolder = folderKey;
+      state.mediaPage = page;
       try {
-        const response = await fetch(`/api/media?folder=${encodeURIComponent(state.activeMediaFolder)}`);
+        const response = await fetch(`/api/media?folder=${encodeURIComponent(state.activeMediaFolder)}&page=${state.mediaPage}`);
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || response.statusText);
         state.mediaFolders = data.folders || state.mediaFolders;
         state.mediaItems = data.items || [];
+        state.mediaHasMore = Boolean(data.has_more);
+        $('mediaPage').textContent = `Page ${state.mediaPage + 1}`;
+        $('mediaPrev').disabled = state.mediaPage === 0;
+        $('mediaNext').disabled = !state.mediaHasMore;
         renderMedia();
         if (data.archive_unavailable) $("clipList").insertAdjacentHTML('afterbegin', '<div class="status">Cloud archive is temporarily unavailable; showing local media.</div>');
       } catch (_error) {
@@ -1997,9 +2012,11 @@ INDEX_HTML = r"""<!doctype html>
       button.disabled = true;
       try {
         await jsonFetch('/api/archive/review', {media_id:button.dataset.reviewId, review:button.dataset.review, note:''});
-        await loadMedia();
+        await loadMedia(state.activeMediaFolder, state.mediaPage);
       } catch (error) { alert(error.message); button.disabled = false; }
     });
+    $('mediaPrev').addEventListener('click', () => loadMedia(state.activeMediaFolder, Math.max(0, state.mediaPage - 1)));
+    $('mediaNext').addEventListener('click', () => { if (state.mediaHasMore) loadMedia(state.activeMediaFolder, state.mediaPage + 1); });
     $("scanButton").addEventListener("click", scanStreams);
     $("manualButton").addEventListener("click", addManualChannel);
     $("refreshLogsButton").addEventListener("click", loadLogs);

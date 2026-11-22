@@ -57,3 +57,16 @@ class ArchiveOutboxTests(unittest.TestCase):
             self.assertEqual(queue.process_one(changed, now=0), 'retry')
             self.assertTrue(clip.exists())
             self.assertTrue(sidecar.exists())
+
+    def test_recent_media_is_processed_before_backlog(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, recent = root/'old.mp4', root/'recent.mp4'
+            old.write_bytes(b'old'); recent.write_bytes(b'new')
+            os.utime(old, (1, 1)); os.utime(recent, (100, 100))
+            queue = ArchiveOutbox(root/'queue.db')
+            queue.enqueue(old, 'motion', {}); queue.enqueue(recent, 'motion', {})
+            seen = []
+            queue.process_one(lambda _id, path, *_: seen.append(path.name) or True, now=0)
+            self.assertEqual(seen, ['recent.mp4'])

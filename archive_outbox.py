@@ -25,7 +25,11 @@ class ArchiveOutbox:
                 id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
                 metadata TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
-                last_error TEXT, retain_local INTEGER NOT NULL DEFAULT 0)''')
+                last_error TEXT, retain_local INTEGER NOT NULL DEFAULT 0,
+                priority REAL NOT NULL DEFAULT 0)''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(archive_jobs)')}
+            if 'priority' not in columns:
+                db.execute('ALTER TABLE archive_jobs ADD COLUMN priority REAL NOT NULL DEFAULT 0')
         os.chmod(self.database, 0o600)
 
     @contextmanager
@@ -50,8 +54,8 @@ class ArchiveOutbox:
                     raise ValueError('Archive path already has different metadata')
                 return existing[0]
             job_id = str(uuid.uuid4())
-            db.execute('INSERT INTO archive_jobs(id,path,kind,metadata,retain_local) VALUES (?,?,?,?,?)',
-                       (job_id, path, kind, encoded, int(retain_local)))
+            db.execute('INSERT INTO archive_jobs(id,path,kind,metadata,retain_local,priority) VALUES (?,?,?,?,?,?)',
+                       (job_id, path, kind, encoded, int(retain_local), Path(path).stat().st_mtime))
             return job_id
 
     def retry_cleanup(self, path):
@@ -78,7 +82,7 @@ class ArchiveOutbox:
         now = time.time() if now is None else now
         with self.connect() as db:
             row = db.execute('SELECT id,path,kind,metadata,attempts,retain_local FROM archive_jobs '
-                             "WHERE state='pending' AND retry_at<=? ORDER BY rowid LIMIT 1", (now,)).fetchone()
+                             "WHERE state='pending' AND retry_at<=? ORDER BY priority DESC,rowid LIMIT 1", (now,)).fetchone()
         if not row:
             return None
         job_id, filename, kind, metadata, attempts, retain_local = row
