@@ -148,6 +148,7 @@ class WorkerState:
     thread: threading.Thread
     kind: str
     sensitivity: int = 5
+    motion_algorithm: str = "difference"
     status: str = "starting"
     object_recording: bool = False
     object_error: bool = False
@@ -217,6 +218,7 @@ class WebAppState:
                     "label": worker.label,
                     "kind": worker.kind,
                     "sensitivity": worker.sensitivity,
+                    "motion_algorithm": worker.motion_algorithm,
                     "status": worker.status,
                     "frame_age_seconds": round(max(0, time.monotonic() - worker.last_frame_at), 1),
                     "recording": worker.status.startswith("Recording clip:"),
@@ -237,6 +239,8 @@ class WebAppState:
 APP_STATE = WebAppState()
 CAMERA_REGISTRY = CameraRegistry()
 SUPERVISOR_STOP = threading.Event()
+from clip_replay import ClipReplay
+CLIP_REPLAY = ClipReplay(Path.home() / 'SecurityCamera' / 'clip_tests')
 ARCHIVE_MANAGER = None
 ARCHIVE_ENABLED = os.getenv("MEDIA_ARCHIVE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
@@ -405,7 +409,7 @@ def start_camera(payload, restore=False):
     FrameDifferenceMotion.validate_exclusions(exclusions)
     vehicle_area = load_vehicle_areas().get(stream.stream_id, LocalVehicleVerifier.default_crop(stream.stream_id))
     worker = WorkerState(source_id=stream.stream_id, label=stream.label, stop_event=threading.Event(),
-                         thread=None, kind="camera", sensitivity=sensitivity,
+                         thread=None, kind="camera", sensitivity=sensitivity, motion_algorithm=algorithm,
                          excluded_areas=exclusions, vehicle_area=vehicle_area)
     worker.thread = threading.Thread(target=run_camera_worker,
         args=(worker, stream, settings, sensitivity, exclusions, algorithm), daemon=True)
@@ -641,6 +645,17 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
                     "selected_not_running": len(set(selected) - active), "archive_enabled": ARCHIVE_ENABLED, "archive": archive, "alerts": alerts})
             except (OSError, ValueError):
                 return self.send_json({"error": "Health status unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+        if parsed.path == "/api/clip-test":
+            return self.send_json({"job": CLIP_REPLAY.snapshot()})
+        if parsed.path.startswith('/replay-media/'):
+            parts = unquote(parsed.path[len('/replay-media/'):]).split('/')
+            if not parts or len(parts[0]) != 32 or not all(c in '0123456789abcdef' for c in parts[0]):
+                return self.send_error(HTTPStatus.BAD_REQUEST)
+            root = (CLIP_REPLAY.root / parts[0]).resolve()
+            path = root.joinpath(*parts[1:]).resolve()
+            if root not in path.parents or not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS | IMAGE_EXTENSIONS:
+                return self.send_error(HTTPStatus.NOT_FOUND)
+            return self.send_file_path(path)
         if parsed.path == "/api/logs":
             return self.send_json({"text": read_log_tail()})
         if parsed.path == "/api/media":
@@ -720,6 +735,8 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == '/api/clip-test':
+            return self.handle_clip_test(parsed)
         if parsed.path == "/api/archive/review":
             import uuid
             payload = self.read_json()
@@ -744,6 +761,45 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/preview/set":
             return self.handle_preview_set()
         self.send_error(HTTPStatus.NOT_FOUND)
+
+    def handle_clip_test(self, parsed):
+        import shutil
+        params = parse_qs(parsed.query)
+        source_id = params.get('camera', [''])[0]
+        worker = APP_STATE.get_worker(source_id)
+        if worker is None:
+            return self.send_json({'error': 'Choose a running camera.'}, HTTPStatus.BAD_REQUEST)
+        if OBJECT_DETECTOR is None or OBJECT_DETECTOR.health() not in ('ready', 'degraded'):
+            return self.send_json({'error': 'Object detection is not ready.'}, HTTPStatus.SERVICE_UNAVAILABLE)
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if length <= 0 or length > 250 * 1024 * 1024:
+                raise ValueError('Choose a video no larger than 250 MB.')
+            suffix = Path(params.get('filename', [''])[0]).suffix.lower()
+            CLIP_REPLAY.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if shutil.disk_usage(CLIP_REPLAY.root).free < length + 2048 * 1024 * 1024:
+                raise ValueError('Not enough free disk space for this test.')
+            path, recorded_at = CLIP_REPLAY.reserve(worker, params.get('recorded_at', [''])[0], suffix)
+        except (ValueError, OSError) as exc:
+            return self.send_json({'error': str(exc)}, HTTPStatus.BAD_REQUEST)
+        try:
+            remaining = length
+            self.connection.settimeout(30)
+            with path.open('xb') as output:
+                os.chmod(path, 0o600)
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise OSError('Upload ended early')
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            CLIP_REPLAY.start(path, recorded_at, worker, OBJECT_DETECTOR, worker.motion_algorithm)
+            return self.send_json({'job': CLIP_REPLAY.snapshot()}, HTTPStatus.ACCEPTED)
+        except (OSError, ValueError) as exc:
+            path.unlink(missing_ok=True)
+            CLIP_REPLAY.fail('Upload failed. Please try again.')
+            logging.warning('Clip test upload failed (%s)', type(exc).__name__)
+            return self.send_json({'error': 'Upload failed.'}, HTTPStatus.BAD_REQUEST)
 
     def handle_scan(self):
         payload = self.read_json()
@@ -881,6 +937,9 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "Media file not found")
             return
 
+        return self.send_file_path(media_path)
+
+    def send_file_path(self, media_path):
         file_size = media_path.stat().st_size
         content_type = mimetypes.guess_type(media_path.name)[0] or "application/octet-stream"
         range_header = self.headers.get("Range", "")
@@ -1398,6 +1457,20 @@ INDEX_HTML = r"""<!doctype html>
       <section>
         <h2>Previews</h2>
         <div id="previewGrid" class="preview-grid"></div>
+      </section>
+
+      <section>
+        <h2>Test a clip</h2>
+        <p class="status">Replays the live motion, object and scenario stages using the selected camera settings. No WhatsApp is sent. Tests run at recording speed and may slow live detection. Test files stay on this Pi, separate from the live archive.</p>
+        <label for="clipTestCamera">Camera settings</label>
+        <select id="clipTestCamera"><option value="">Choose a running camera</option></select>
+        <label for="clipTestTime">When was the clip recorded? (South Africa time)</label>
+        <input id="clipTestTime" type="datetime-local" step="1">
+        <label for="clipTestFile">Video (up to 250 MB)</label>
+        <input id="clipTestFile" type="file" accept=".mp4,.mov,.avi,.mkv,.m4v,video/*">
+        <div class="actions"><button id="clipTestStart" type="button">Run clip test</button></div>
+        <div id="clipTestStatus" class="status" role="status">No clip test running.</div>
+        <div id="clipTestResults"></div>
       </section>
 
       <section>
@@ -1948,6 +2021,11 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const response = await fetch("/api/workers");
         const data = await response.json();
+        const cameraSelect = $('clipTestCamera');
+        const selectedCamera = cameraSelect.value;
+        cameraSelect.innerHTML = '<option value="">Choose a running camera</option>' + data.workers.map(worker =>
+          `<option value="${escapeAttribute(worker.source_id)}">${escapeHtml(worker.label)} (sensitivity ${worker.sensitivity})</option>`).join('');
+        if (data.workers.some(worker => worker.source_id === selectedCamera)) cameraSelect.value = selectedCamera;
         const activeIds = new Set(data.workers.map((worker) => worker.source_id));
         for (const worker of data.workers) {
           addPreview(worker.source_id, worker.label, worker.preview_enabled, worker.excluded_areas || [], worker.recording, worker.status, worker.object_recording, worker.object_detection_status, worker.sensitivity, worker.vehicle_area, worker.object_processing, worker.detected_objects || []);
@@ -1965,6 +2043,36 @@ INDEX_HTML = r"""<!doctype html>
         setStatus("Disconnected");
       }
     }
+
+    function renderClipTest(job) {
+      if (!job) return;
+      const progress = job.duration ? `${Math.round(job.position)} / ${Math.round(job.duration)} seconds` : `${Math.round(job.position)} seconds`;
+      $('clipTestStatus').textContent = `Test ${job.status} · ${progress} · ${job.motion_checks} motion checks · ${job.object_checks} object checks${job.error ? ` · ${job.error}` : ''}`;
+      $('clipTestStart').disabled = ['uploading', 'running'].includes(job.status);
+      const files = (job.files || []).map(file => `<a href="${escapeAttribute(file.url)}" target="_blank" rel="noreferrer">${escapeHtml(file.kind)}: ${escapeHtml(file.name)}</a>`).join('');
+      const events = (job.events || []).map(event => `<div class="clip-meta">${escapeHtml(formatDateTime(event.captured_at))}: ${escapeHtml((event.objects || []).join(', ') || 'no objects')}${(event.scenarios || []).length ? ` · Rule: ${escapeHtml(event.scenarios.map(x => x.reason).join('; '))}` : ''}${(event.decisions || []).length ? ` · ${escapeHtml([...new Set(event.decisions)].join('; '))}` : ''}</div>`).join('');
+      $('clipTestResults').innerHTML = `${files ? `<div class="clip-actions">${files}</div>` : ''}${events || ''}`;
+    }
+    async function pollClipTest() {
+      try {
+        const response = await fetch('/api/clip-test');
+        if (response.ok) renderClipTest((await response.json()).job);
+      } catch (_error) { /* Keep the last status visible. */ }
+    }
+    $('clipTestStart').addEventListener('click', async () => {
+      const file = $('clipTestFile').files[0], camera = $('clipTestCamera').value, recorded = $('clipTestTime').value;
+      if (!file || !camera || !recorded) { $('clipTestStatus').textContent = 'Choose a camera, recording time and video.'; return; }
+      if (file.size > 250 * 1024 * 1024) { $('clipTestStatus').textContent = 'The video must be 250 MB or smaller.'; return; }
+      $('clipTestStart').disabled = true;
+      $('clipTestStatus').textContent = 'Uploading clip…';
+      try {
+        const query = new URLSearchParams({camera, recorded_at:recorded, filename:file.name});
+        const response = await fetch(`/api/clip-test?${query}`, {method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Clip upload failed.');
+        renderClipTest(data.job);
+      } catch (error) { $('clipTestStatus').textContent = error.message; $('clipTestStart').disabled = false; }
+    });
 
     async function pollHealth() {
       try {
@@ -2073,6 +2181,8 @@ INDEX_HTML = r"""<!doctype html>
     loadLogs();
     loadMedia();
     pollHealth();
+    pollClipTest();
+    setInterval(pollClipTest, 3000);
     setInterval(pollHealth, 10000);
     setInterval(pollWorkers, 3000);
     setInterval(loadLogs, 3000);
@@ -2134,6 +2244,7 @@ def main(argv=None):
         supervisor.join(timeout=2)
         workers = list(APP_STATE.workers.values())
         stop_all_workers()
+        CLIP_REPLAY.stop()
         for worker in workers:
             worker.thread.join(timeout=30)
         server.server_close()

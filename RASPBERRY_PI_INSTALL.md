@@ -17,3 +17,9 @@ An object clip with an alert is retained locally until the alert receives an aff
 The archive requires a network connection and Azure/API capacity. Existing files remain on the Pi while uploads are pending. At the motion clip limit, motion recording pauses but object detection continues. Low free disk space can prevent both motion and object recordings and consequently prevent clip-based alerts. Monitor health warnings and disk space; the archive is not a substitute for backups or a retention policy.
 
 Use independent footage when evaluating misses: motion-triggered clips alone cannot show events for which motion never triggered. Save representative footage from each new camera in day, night, rain, glare and low-quality stream conditions. Manually label people and vehicles and review both false alarms and missed events before adjusting sensitivity or training a model.
+
+## Test a clip
+
+In **Test a clip**, select a running camera, enter the original recording date and time in South Africa time, and choose a video up to 250 MB. The test replays at the clip's recording speed using that camera's sensitivity, detection method and exclusion areas. It shares the live object detector, including the person verifier, so live processing can slow down while a test runs. The first five seconds are used to warm up motion detection; short clips may have little time left for detection. The entered recording time drives time-of-day rules; the app does not read the camera's printed timestamp.
+
+The result shows motion and object checks, matched person scenarios, and links to the test's source, motion clips, object clips and evidence images. Tests never send WhatsApp notifications. Test files stay in `~/SecurityCamera/clip_tests`, outside the live archive. The most recent test can be viewed after restarting the app; a test interrupted by a restart is marked as incomplete.

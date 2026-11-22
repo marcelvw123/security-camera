@@ -98,7 +98,7 @@ class SharedObjectDetector:
         self.thread = threading.Thread(target=self._run, daemon=True, name='object-inference')
         self.thread.start()
 
-    def submit(self, camera, frame, timestamp, motion_boxes=None, motion_pair=None):
+    def submit(self, camera, frame, timestamp, motion_boxes=None, motion_pair=None, captured_at=None):
         from motion_crop import select_motion_crop
         crop = select_motion_crop(motion_boxes, frame.shape[1], frame.shape[0])
         if crop is None:
@@ -108,7 +108,7 @@ class SharedObjectDetector:
                 return
             self.last_submitted[camera] = timestamp
             self.pending[camera] = (frame.copy(), timestamp, self.generations.get(camera, 0), crop,
-                                    list(motion_boxes), motion_pair, datetime.now(timezone.utc).isoformat())
+                                    list(motion_boxes), motion_pair, captured_at or datetime.now(timezone.utc).isoformat())
             self.condition.notify()
 
     def take(self, camera):
@@ -136,6 +136,10 @@ class SharedObjectDetector:
         with self.condition:
             processing = self.processing_camera == camera
         return processing or bool(self.remote_shadow and self.remote_shadow.is_processing(camera))
+
+    def has_pending(self, camera):
+        with self.condition:
+            return camera in self.pending or self.processing_camera == camera or camera in self.results
 
     def health(self):
         with self.condition:
@@ -415,9 +419,10 @@ class LocalVehicleVerifier(RemoteVehicleShadow):
 class ObjectClipRecorder:
     """Create one separate short clip for a confirmed event using capture frames."""
     def __init__(self, detector, camera, output_dir, writer_factory, status_callback, preroll,
-                 min_free_bytes, fps=10, seconds=20, alert_camera=None):
+                 min_free_bytes, fps=10, seconds=20, alert_camera=None, send_alerts=True):
         self.detector, self.camera = detector, camera
         self.alert_camera = alert_camera or camera
+        self.send_alerts = send_alerts
         self.output_dir, self.writer_factory = Path(output_dir), writer_factory
         self.status_callback, self.min_free_bytes = status_callback, min_free_bytes
         self.fps, self.seconds = fps, seconds
@@ -440,13 +445,16 @@ class ObjectClipRecorder:
         self.end_time = self.next_frame = 0
         self.next_disk_check = 0
 
-    def observe(self, frame, now, motion_active, motion_boxes=None, motion_pair=None):
+    def observe(self, frame, now, motion_active, motion_boxes=None, motion_pair=None, captured_at=None):
         import shutil
         from datetime import datetime
         from motion_preroll import AsyncPreRollWriter
         # No object inference or baseline scan runs without a fresh motion crop.
         if motion_boxes:
-            self.detector.submit(self.camera, frame, now, motion_boxes, motion_pair)
+            if captured_at is None:
+                self.detector.submit(self.camera, frame, now, motion_boxes, motion_pair)
+            else:
+                self.detector.submit(self.camera, frame, now, motion_boxes, motion_pair, captured_at=captured_at)
         result = self.detector.take(self.camera)
         found = []
         checked = []
@@ -592,7 +600,7 @@ class ObjectClipRecorder:
                 from motion_clip_metadata import finish_metadata, load_metadata
                 finish_metadata(writer.path)
                 self.status_callback(False)
-            if saved and os.getenv('WHATSAPP_OBJECT_ALERTS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on'):
+            if saved and self.send_alerts and os.getenv('WHATSAPP_OBJECT_ALERTS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on'):
                 metadata = load_metadata(writer.path)
                 if metadata and metadata.get('alert_objects'):
                     from object_alerts import queue_object_alert
