@@ -59,6 +59,11 @@ class ObjectGateTests(unittest.TestCase):
         self.assertEqual(gate.update([detection('person', 102)], 14, 1000), ['person'])
 
 class ObjectClipTests(unittest.TestCase):
+    def setUp(self):
+        env = patch.dict('os.environ', {'WHATSAPP_OBJECT_ALERTS_ENABLED': 'false'})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_idle_baseline_does_not_write_detection_images_or_start_clips(self):
         detector = MagicMock()
         frame = np.zeros((100,100,3), np.uint8)

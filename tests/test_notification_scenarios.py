@@ -14,6 +14,11 @@ def person(box):
 
 
 class NotificationScenarioTests(unittest.TestCase):
+    def setUp(self):
+        env = patch.dict('os.environ', {'WHATSAPP_OBJECT_ALERTS_ENABLED': 'false'})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_one_person_at_overnight_boundaries(self):
         detections=[person([0,0,10,20])]
         for time,expected in [('2026-11-20T20:59:59+02:00',False),('2026-11-20T21:00:00+02:00',True),

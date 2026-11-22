@@ -8,6 +8,11 @@ from object_detection import ObjectClipRecorder, process_motion_frame
 
 
 class ActiveMotionGateTests(unittest.TestCase):
+    def setUp(self):
+        env = patch.dict('os.environ', {'WHATSAPP_OBJECT_ALERTS_ENABLED': 'false'})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_no_full_frame_inference_without_confirmed_crop(self):
         frame=np.zeros((100,100,3),np.uint8);model=MagicMock();gate=MagicMock()
         gate.observe.return_value=[{'label':'bus','qualified':False}]
