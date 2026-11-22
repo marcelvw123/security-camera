@@ -776,10 +776,13 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             if length <= 0 or length > 250 * 1024 * 1024:
                 raise ValueError('Choose a video no larger than 250 MB.')
             suffix = Path(params.get('filename', [''])[0]).suffix.lower()
+            if suffix in IMAGE_EXTENSIONS and length > 25 * 1024 * 1024:
+                raise ValueError('Choose an image no larger than 25 MB.')
+            stage = params.get('stage', ['motion'])[0]
             CLIP_REPLAY.root.mkdir(parents=True, exist_ok=True, mode=0o700)
             if shutil.disk_usage(CLIP_REPLAY.root).free < length + 2048 * 1024 * 1024:
                 raise ValueError('Not enough free disk space for this test.')
-            path, recorded_at = CLIP_REPLAY.reserve(worker, params.get('recorded_at', [''])[0], suffix)
+            path, recorded_at = CLIP_REPLAY.reserve(worker, params.get('recorded_at', [''])[0], suffix, stage)
         except (ValueError, OSError) as exc:
             return self.send_json({'error': str(exc)}, HTTPStatus.BAD_REQUEST)
         try:
@@ -1460,16 +1463,18 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section>
-        <h2>Test a clip</h2>
-        <p class="status">Replays the live motion, object and scenario stages using the selected camera settings. No WhatsApp is sent. Tests run at recording speed and may slow live detection. Test files stay on this Pi, separate from the live archive.</p>
+        <h2>Test an image or clip</h2>
+        <p class="status">Choose where to start. Motion needs video; object and scenario tests skip motion. Scenario testing first identifies objects in the image. No WhatsApp is sent. Videos run at recording speed and may slow live detection. Test files stay on this Pi, separate from the live archive.</p>
         <label for="clipTestCamera">Camera settings</label>
         <select id="clipTestCamera"><option value="">Choose a running camera</option></select>
-        <label for="clipTestTime">When was the clip recorded? (South Africa time)</label>
+        <label for="clipTestStage">Start at</label>
+        <select id="clipTestStage"><option value="motion">Motion → Object → Scenario (video only)</option><option value="object">Object → Scenario</option><option value="scenario">Scenario (with object detection)</option></select>
+        <label for="clipTestTime">When was the image or clip recorded? (South Africa time)</label>
         <input id="clipTestTime" type="datetime-local" step="1">
-        <label for="clipTestFile">Video (up to 250 MB)</label>
-        <input id="clipTestFile" type="file" accept=".mp4,.mov,.avi,.mkv,.m4v,video/*">
-        <div class="actions"><button id="clipTestStart" type="button">Run clip test</button></div>
-        <div id="clipTestStatus" class="status" role="status">No clip test running.</div>
+        <label for="clipTestFile">Video (up to 250 MB) or JPG/PNG image (up to 25 MB)</label>
+        <input id="clipTestFile" type="file" accept=".mp4,.mov,.avi,.mkv,.m4v,.jpg,.jpeg,.png,video/*,image/jpeg,image/png">
+        <div class="actions"><button id="clipTestStart" type="button">Run test</button></div>
+        <div id="clipTestStatus" class="status" role="status">No test running.</div>
         <div id="clipTestResults"></div>
       </section>
 
@@ -2047,7 +2052,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderClipTest(job) {
       if (!job) return;
       const progress = job.duration ? `${Math.round(job.position)} / ${Math.round(job.duration)} seconds` : `${Math.round(job.position)} seconds`;
-      $('clipTestStatus').textContent = `Test ${job.status} · ${progress} · ${job.motion_checks} motion checks · ${job.object_checks} object checks${job.error ? ` · ${job.error}` : ''}`;
+      $('clipTestStatus').textContent = `Test ${job.status} · started at ${job.stage || 'motion'} · ${progress} · ${job.motion_checks} motion checks · ${job.object_checks} object checks${job.error ? ` · ${job.error}` : ''}`;
       $('clipTestStart').disabled = ['uploading', 'running'].includes(job.status);
       const files = (job.files || []).map(file => `<a href="${escapeAttribute(file.url)}" target="_blank" rel="noreferrer">${escapeHtml(file.kind)}: ${escapeHtml(file.name)}</a>`).join('');
       const checks = job.events || [];
@@ -2063,14 +2068,22 @@ INDEX_HTML = r"""<!doctype html>
         if (response.ok) renderClipTest((await response.json()).job);
       } catch (_error) { /* Keep the last status visible. */ }
     }
+    $('clipTestFile').addEventListener('change', () => {
+      const file = $('clipTestFile').files[0];
+      const isImage = Boolean(file && /\.(jpe?g|png)$/i.test(file.name));
+      const motion = $('clipTestStage').querySelector('option[value="motion"]');
+      motion.disabled = isImage;
+      if (isImage && $('clipTestStage').value === 'motion') $('clipTestStage').value = 'object';
+    });
     $('clipTestStart').addEventListener('click', async () => {
       const file = $('clipTestFile').files[0], camera = $('clipTestCamera').value, recorded = $('clipTestTime').value;
-      if (!file || !camera || !recorded) { $('clipTestStatus').textContent = 'Choose a camera, recording time and video.'; return; }
-      if (file.size > 250 * 1024 * 1024) { $('clipTestStatus').textContent = 'The video must be 250 MB or smaller.'; return; }
+      if (!file || !camera || !recorded) { $('clipTestStatus').textContent = 'Choose a camera, recording time and file.'; return; }
+      const isImage = /\.(jpe?g|png)$/i.test(file.name);
+      if (file.size > (isImage ? 25 : 250) * 1024 * 1024) { $('clipTestStatus').textContent = isImage ? 'The image must be 25 MB or smaller.' : 'The video must be 250 MB or smaller.'; return; }
       $('clipTestStart').disabled = true;
       $('clipTestStatus').textContent = 'Uploading clip…';
       try {
-        const query = new URLSearchParams({camera, recorded_at:recorded, filename:file.name});
+        const query = new URLSearchParams({camera, recorded_at:recorded, filename:file.name, stage:$('clipTestStage').value});
         const response = await fetch(`/api/clip-test?${query}`, {method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Clip upload failed.');

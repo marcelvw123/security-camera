@@ -108,8 +108,19 @@ class SharedObjectDetector:
                 return
             self.last_submitted[camera] = timestamp
             self.pending[camera] = (frame.copy(), timestamp, self.generations.get(camera, 0), crop,
-                                    list(motion_boxes), motion_pair, captured_at or datetime.now(timezone.utc).isoformat())
+                                    list(motion_boxes), motion_pair, captured_at or datetime.now(timezone.utc).isoformat(), 'motion')
             self.condition.notify()
+
+    def submit_scene(self, camera, frame, timestamp, captured_at):
+        """Test-only full-frame inference through the same shared model worker."""
+        with self.condition:
+            if self.status == 'error' or timestamp - self.last_submitted.get(camera, -float('inf')) < self.interval:
+                return False
+            self.last_submitted[camera] = timestamp
+            self.pending[camera] = (frame.copy(), timestamp, self.generations.get(camera, 0),
+                                    None, [], None, captured_at, 'scene')
+            self.condition.notify()
+            return True
 
     def take(self, camera):
         with self.condition:
@@ -169,14 +180,17 @@ class SharedObjectDetector:
             while True:
                 with self.condition:
                     self.condition.wait_for(lambda: bool(self.pending))
-                    camera, (frame, timestamp, generation, crop, regions, motion_pair, captured_at) = self.pending.popitem(last=False)
+                    camera, (frame, timestamp, generation, crop, regions, motion_pair, captured_at, mode) = self.pending.popitem(last=False)
                     self.processing_camera = camera
                     self.processing_started = time.monotonic()
                 if camera not in gates or gates[camera][0] != generation:
                     gates[camera] = (generation, MovingObjectGate())
                 try:
-                    detections, crop_result = process_motion_frame(
-                        model, frame, crop, regions, motion_pair, gates[camera][1], timestamp, person_verifier)
+                    if mode == 'scene':
+                        detections, crop_result = process_scene_frame(model, frame, captured_at, person_verifier)
+                    else:
+                        detections, crop_result = process_motion_frame(
+                            model, frame, crop, regions, motion_pair, gates[camera][1], timestamp, person_verifier)
                     crop_result['captured_at'] = captured_at
                     if crop_result.get('person_verification_error'):
                         self.status = 'degraded'
@@ -184,14 +198,14 @@ class SharedObjectDetector:
                         self.status = 'ready'
                 except Exception:
                     logging.exception('Motion-gated detection failed for %s', camera)
-                    detections, crop_result = [], {'crop_box': list(crop), 'motion_regions': regions,
+                    detections, crop_result = [], {'crop_box': list(crop) if crop is not None else None, 'motion_regions': regions,
                                                   'error': 'motion-gated inference failed'}
                 with self.condition:
                     self.processing_camera = None
                     self.processing_started = None
                     if generation == self.generations.get(camera, 0):
                         self.results[camera] = (timestamp, frame.shape[1], detections,
-                                                frame if detections else None, crop_result)
+                                                frame if detections or mode == 'scene' else None, crop_result)
         except Exception:
             logging.exception('Object detection stopped')
             with self.condition:
@@ -199,6 +213,44 @@ class SharedObjectDetector:
                 self.processing_camera = None
                 self.processing_started = None
                 self.pending.clear()
+
+
+def predict_full_frame(model, frame):
+    scene = model.predict(frame, classes=[0, 2, 3, 5, 7], conf=.35,
+                          imgsz=640, device='cpu', verbose=False)[0]
+    return [{'label': model.names[int(cls)], 'box': [float(v) for v in box], 'confidence': float(conf)}
+            for box, conf, cls in zip(scene.boxes.xyxy, scene.boxes.conf, scene.boxes.cls)]
+
+
+def verify_full_people(person_verifier, frame, full, comparison):
+    from notification_scenarios import count_people
+    comparison['verified_full_people'] = []
+    if count_people(full) >= 2:
+        if person_verifier is None:
+            comparison['person_verification_error'] = 'person verifier unavailable'
+        else:
+            try:
+                from person_verifier import verify_scene_people
+                checked = verify_scene_people(person_verifier, frame, full)
+                comparison['person_verification'] = checked
+                comparison['verified_full_people'] = [
+                    {**item, 'box': item['verification_box']} for item in checked if item['verified']]
+            except Exception:
+                logging.exception('Person verification failed')
+                comparison['person_verification_error'] = 'person verification failed'
+
+
+def process_scene_frame(model, frame, captured_at, person_verifier=None):
+    """Start at full-frame object detection; evaluate the normal final scenario rules."""
+    from notification_scenarios import evaluate_person_scenario, scenario_people
+    full = predict_full_frame(model, frame)
+    details = {'full_frame_detections': full, 'combined': full, 'full_frame_ran': True,
+               'motion_skipped': True, 'captured_at': captured_at}
+    verify_full_people(person_verifier, frame, full, details)
+    people = scenario_people(full, full, details['verified_full_people'])
+    event = evaluate_person_scenario(people, captured_at)
+    details['scenarios'] = [event] if event else []
+    return [(item['label'], item['box'], item['confidence']) for item in full], details
 
 
 def process_motion_frame(model, frame, crop, regions, motion_pair, gate, timestamp, person_verifier=None):
@@ -221,11 +273,8 @@ def process_motion_frame(model, frame, crop, regions, motion_pair, gate, timesta
         comparison['combined'] = []
         comparison['full_frame_ran'] = False
         return [], comparison
-    scene = model.predict(frame, classes=[0, 2, 3, 5, 7], conf=.35,
-                          imgsz=640, device='cpu', verbose=False)[0]
-    full = [{'label': model.names[int(cls)], 'box': [float(v) for v in box], 'confidence': float(conf)}
-            for box, conf, cls in zip(scene.boxes.xyxy, scene.boxes.conf, scene.boxes.cls)]
-    from notification_scenarios import count_people, crop_person_supported
+    full = predict_full_frame(model, frame)
+    from notification_scenarios import crop_person_supported
     for item in gated:
         if item['qualified'] and not crop_person_supported(item, full, height):
             item.update(qualified=False, reason='small person not confirmed in full frame')
@@ -235,20 +284,7 @@ def process_motion_frame(model, frame, crop, regions, motion_pair, gate, timesta
     comparison['full_frame_ran'] = True
     if not any(item['qualified'] for item in gated):
         return [], comparison
-    comparison['verified_full_people'] = []
-    if count_people(full) >= 2:
-        if person_verifier is None:
-            comparison['person_verification_error'] = 'person verifier unavailable'
-        else:
-            try:
-                from person_verifier import verify_scene_people
-                checked = verify_scene_people(person_verifier, frame, full)
-                comparison['person_verification'] = checked
-                comparison['verified_full_people'] = [
-                    {**item, 'box': item['verification_box']} for item in checked if item['verified']]
-            except Exception:
-                logging.exception('Person verification failed')
-                comparison['person_verification_error'] = 'person verification failed'
+    verify_full_people(person_verifier, frame, full, comparison)
     return [(item['label'], item['box'], item['confidence']) for item in comparison['combined']], comparison
 
 class RemoteVehicleShadow:

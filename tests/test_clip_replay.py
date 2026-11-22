@@ -140,3 +140,52 @@ class ClipTestUploadTests(unittest.TestCase):
         with patch.object(webapp,'OBJECT_DETECTOR',detector), patch.object(webapp.APP_STATE,'get_worker',return_value=MagicMock()):
             webapp.SecurityCameraWebHandler.handle_clip_test(handler,urlparse('/api/clip-test?camera=x&filename=clip.mp4'))
         self.assertEqual(handler.send_json.call_args.args[1],400)
+
+class StageSelectionTests(unittest.TestCase):
+    def test_image_motion_rejected_and_valid_stages_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager=ClipReplay(directory); worker=MagicMock(label='Camera')
+            with self.assertRaisesRegex(ValueError, 'Motion detection needs'):
+                manager.reserve(worker, '2026-11-20T22:00', '.jpg', 'motion')
+            source, _ = manager.reserve(worker, '2026-11-20T22:00', '.jpg', 'scenario')
+            self.assertEqual(source.suffix,'.jpg')
+            self.assertEqual(manager.snapshot()['stage'],'scenario')
+
+    def test_full_frame_scenario_uses_person_verification(self):
+        from object_detection import process_scene_frame
+        from types import SimpleNamespace
+        model=MagicMock(); model.names={0:'person'}
+        model.predict.return_value=[SimpleNamespace(boxes=SimpleNamespace(
+            xyxy=[[0,0,20,40],[30,0,50,40]],conf=[.9,.8],cls=[0,0]))]
+        verified=[{'label':'person','box':[0.,0.,20.,40.],'confidence':.9,'verified':True,'verification_box':[0.,0.,20.,40.]},
+                  {'label':'person','box':[30.,0.,50.,40.],'confidence':.8,'verified':True,'verification_box':[30.,0.,50.,40.]}]
+        with patch('person_verifier.verify_scene_people',return_value=verified):
+            detections, details=process_scene_frame(model,np.zeros((64,64,3),dtype=np.uint8),'2026-11-20T14:00:00+02:00',MagicMock())
+        self.assertEqual(len(detections),2)
+        self.assertEqual(details['scenarios'][0]['scenario'],'two_or_more_people')
+        self.assertTrue(details['motion_skipped'])
+
+    def test_image_scene_test_outputs_annotated_frame_without_motion_or_whatsapp(self):
+        class Detector:
+            remote_shadow=None
+            def __init__(self): self.result=None
+            def submit_scene(self, camera, frame, timestamp, captured_at):
+                details={'captured_at':captured_at,'scenarios':[{'scenario':'one_person_overnight','reason':'1 person detected between 21:00 and 05:00'}]}
+                self.result=(timestamp,frame.shape[1],[('person',[2,2,20,40],.9)],frame,details);return True
+            def take(self,camera): result,self.result=self.result,None;return result
+            def has_pending(self,camera):return self.result is not None
+            def remove(self,camera):pass
+        with tempfile.TemporaryDirectory() as directory:
+            manager=ClipReplay(directory);worker=MagicMock(label='Camera');detector=Detector()
+            path,recorded=manager.reserve(worker,'2026-11-20T22:15','.jpg','object')
+            self.assertTrue(cv2.imwrite(str(path),np.zeros((64,64,3),dtype=np.uint8)))
+            with patch('clip_replay.run_detection') as motion, patch('object_alerts.queue_object_alert') as notify, \
+                 patch('shutil.disk_usage',return_value=MagicMock(free=10_000_000_000)):
+                manager.start(path,recorded,worker,detector,'difference');manager.thread.join(timeout=3)
+                motion.assert_not_called();notify.assert_not_called()
+            result=manager.snapshot()
+            self.assertEqual(result['status'],'complete')
+            self.assertEqual(result['motion_checks'],0)
+            self.assertEqual(result['object_checks'],1)
+            self.assertEqual(result['events'][0]['scenarios'][0]['scenario'],'one_person_overnight')
+            self.assertTrue(any(f['kind']=='image' for f in result['files']))
