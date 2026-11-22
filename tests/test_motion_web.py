@@ -64,6 +64,18 @@ class MotionWebTests(unittest.TestCase):
             self.assertEqual(item['alert_decisions'],['stationary vehicle present during baseline'])
             self.assertEqual(item['motion_associations'][0]['status'],'associated')
 
+    def test_archived_detection_checks_are_not_repeated(self):
+        import json
+        metadata = {'detections': {'objects': [], 'alert_decisions': [
+            'motion crop did not confirm a moving object',
+            'motion crop did not confirm a moving object',
+            'another check']}}
+        row = {'MediaId': '446dd55e-3a66-43dd-a849-ed275800a18d',
+               'Filename': 'motion_test.mp4', 'MetadataJson': json.dumps(metadata)}
+        with patch.object(webapp, 'list_archive', return_value={'items': [row]}):
+            item = webapp.list_archived_media('clips')[0]
+        self.assertEqual(item['alert_decisions'], ['another check', 'motion crop did not confirm a moving object'])
+
     def test_worker_summary_reports_active_recording(self):
         state = webapp.WebAppState()
         worker = webapp.WorkerState('camera:1', 'Camera 1', MagicMock(), MagicMock(), 'camera')

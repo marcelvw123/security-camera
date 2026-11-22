@@ -465,6 +465,12 @@ def media_folder_config(folder_key):
     return MEDIA_FOLDERS.get(folder_key)
 
 
+def summarize_detection_decisions(metadata):
+    """Display each distinct check once while retaining the full saved history."""
+    return sorted({reason.strip() for reason in (metadata or {}).get('alert_decisions', [])
+                   if isinstance(reason, str) and reason.strip()})
+
+
 def list_saved_media(folder_key, limit=80):
     folder = media_folder_config(folder_key)
     if folder is None:
@@ -499,7 +505,7 @@ def list_saved_media(folder_key, limit=80):
                 "detection_title": title_for_metadata(metadata) if folder_key == 'clips' else None,
                 "delivery_status": delivery_status,
                 "alert_reasons": sorted({str(event.get('reason')) for event in (metadata or {}).get('alert_events', []) if isinstance(event, dict) and event.get('reason')}),
-                "alert_decisions": sorted({str(reason) for reason in (metadata or {}).get('alert_decisions', []) if isinstance(reason, str)}),
+                "alert_decisions": summarize_detection_decisions(metadata),
                 "motion_associations": (metadata or {}).get('motion_associations', []),
                 "crop_comparisons": (metadata or {}).get('crop_comparisons', []),
                 "evidence": evidence,
@@ -533,7 +539,7 @@ def list_archived_media(folder_key, offset=0):
                 "review": row.get("Review"), "review_note": row.get("ReviewNote"),
                 "detection_title": title_for_metadata(metadata) if metadata else None,
                 "alert_reasons": sorted({str(e.get("reason")) for e in metadata.get("alert_events", []) if isinstance(e, dict) and e.get("reason")}),
-                "alert_decisions": metadata.get("alert_decisions", []),
+                "alert_decisions": summarize_detection_decisions(metadata),
                 "motion_associations": metadata.get("motion_associations", []),
                 "crop_comparisons": metadata.get("crop_comparisons", []),
                 "evidence": [{"name": name, "url": "/archive-image/" + quote(name, safe="")} for name in metadata.get("evidence", []) if isinstance(name, str) and Path(name).name == name],
