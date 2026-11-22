@@ -32,6 +32,21 @@ class ClipReplayTests(unittest.TestCase):
                 self.assertEqual(run.call_args.kwargs['excluded_areas'], [[0,0,.2,.2]])
                 self.assertEqual(run.call_args.kwargs['replay']['recorded_at'], recorded_at)
 
+    def test_records_unsuccessful_object_checks_for_diagnosis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ClipReplay(directory)
+            worker = MagicMock(label='Front'); detector = MagicMock(); detector.remote_shadow = None
+            path, recorded_at = manager.reserve(worker, '2026-11-20T22:15', '.mp4')
+            path.write_bytes(b'video')
+            def replay(*args, **kwargs):
+                kwargs['replay_check_callback']([(1, [], None, [], ['motion crop did not confirm a moving object'], 'full', [], {'captured_at':'2026-11-20T22:15:01+02:00'})])
+            with patch('clip_replay.run_detection', side_effect=replay):
+                manager.start(path, recorded_at, worker, detector, 'difference')
+                manager.thread.join(timeout=2)
+            job=manager.snapshot()
+            self.assertEqual(job['object_checks'],1)
+            self.assertEqual(job['events'][0]['decisions'], ['motion crop did not confirm a moving object'])
+
     def test_persists_and_recovers_completed_job(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = ClipReplay(directory)

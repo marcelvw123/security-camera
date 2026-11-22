@@ -2050,8 +2050,12 @@ INDEX_HTML = r"""<!doctype html>
       $('clipTestStatus').textContent = `Test ${job.status} · ${progress} · ${job.motion_checks} motion checks · ${job.object_checks} object checks${job.error ? ` · ${job.error}` : ''}`;
       $('clipTestStart').disabled = ['uploading', 'running'].includes(job.status);
       const files = (job.files || []).map(file => `<a href="${escapeAttribute(file.url)}" target="_blank" rel="noreferrer">${escapeHtml(file.kind)}: ${escapeHtml(file.name)}</a>`).join('');
-      const events = (job.events || []).map(event => `<div class="clip-meta">${escapeHtml(formatDateTime(event.captured_at))}: ${escapeHtml((event.objects || []).join(', ') || 'no objects')}${(event.scenarios || []).length ? ` · Rule: ${escapeHtml(event.scenarios.map(x => x.reason).join('; '))}` : ''}${(event.decisions || []).length ? ` · ${escapeHtml([...new Set(event.decisions)].join('; '))}` : ''}</div>`).join('');
-      $('clipTestResults').innerHTML = `${files ? `<div class="clip-actions">${files}</div>` : ''}${events || ''}`;
+      const checks = job.events || [];
+      const labels = [...new Set(checks.flatMap(event => event.objects || []))];
+      const matches = checks.flatMap(event => event.scenarios || []);
+      const summary = job.object_checks ? `Objects: ${labels.length ? labels.join(', ') : 'none identified'} · Scenario matches: ${matches.length}` : 'No object checks yet';
+      const events = checks.map(event => `<div class="clip-meta">${event.captured_at ? escapeHtml(formatDateTime(event.captured_at)) : 'Time unavailable'}: ${escapeHtml((event.objects || []).join(', ') || 'no objects')}${(event.scenarios || []).length ? ` · Rule: ${escapeHtml(event.scenarios.map(x => x.reason).join('; '))}` : ''}${(event.decisions || []).length ? ` · ${escapeHtml([...new Set(event.decisions)].join('; '))}` : ''}</div>`).join('');
+      $('clipTestResults').innerHTML = `<div class="clip-meta">${escapeHtml(summary)}</div>${files ? `<div class="clip-actions">${files}</div>` : ''}${events ? `<details class="evidence-details"><summary>Object check details (${checks.length})</summary>${events}</details>` : ''}`;
     }
     async function pollClipTest() {
       try {

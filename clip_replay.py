@@ -127,11 +127,10 @@ class ClipReplay:
                     else:
                         _timestamp, labels, _evidence, events, decisions, _source, _associations, details = entry
                         self.job['object_checks'] += 1
-                        if labels or events or (details and details.get('error')):
-                            self.job['events'].append({'captured_at': (details or {}).get('captured_at'),
-                                'objects': labels, 'scenarios': events, 'decisions': decisions,
-                                'details': details})
-                            self.job['events'] = self.job['events'][-300:]
+                        self.job['events'].append({'captured_at': (details or {}).get('captured_at'),
+                            'objects': labels, 'scenarios': events, 'decisions': decisions,
+                            'details': details})
+                        self.job['events'] = self.job['events'][-300:]
         def execute():
             try:
                 run_detection(str(path), 'Clip test - ' + worker.label, set(), self.stop_event.is_set,
