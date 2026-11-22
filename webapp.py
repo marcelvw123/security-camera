@@ -5,6 +5,9 @@ from runtime_warnings import configure_runtime_warnings
 configure_runtime_warnings()
 
 import argparse
+import io
+import re
+import zipfile
 import json
 import logging
 import mimetypes
@@ -19,10 +22,12 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from app_config import load_dotenv
 from camera_discovery import DiscoveredStream, discover_nvr_streams
+from camera_registry import CameraRegistry
+from archive_client import archive_request, list_archive
 from network_guess import likely_dvr_ip
 from motion_difference import FrameDifferenceMotion
 from object_detection import LocalVehicleVerifier
@@ -151,6 +156,7 @@ class WorkerState:
     preview_enabled: bool = True
     frame: bytes | None = None
     frame_version: int = 0
+    last_frame_at: float = field(default_factory=time.monotonic)
     condition: threading.Condition = field(default_factory=threading.Condition)
     started_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     excluded_areas: list = field(default_factory=list)
@@ -212,11 +218,12 @@ class WebAppState:
                     "kind": worker.kind,
                     "sensitivity": worker.sensitivity,
                     "status": worker.status,
+                    "frame_age_seconds": round(max(0, time.monotonic() - worker.last_frame_at), 1),
                     "recording": worker.status.startswith("Recording clip:"),
                     "object_recording": worker.object_recording,
                     "object_processing": bool(OBJECT_DETECTOR and OBJECT_DETECTOR.is_processing(worker.source_id)),
                     "detected_objects": worker.recent_objects(),
-                    "object_detection_status": 'error' if worker.object_error else (OBJECT_DETECTOR.status if OBJECT_DETECTOR else 'disabled'),
+                    "object_detection_status": 'error' if worker.object_error else (OBJECT_DETECTOR.health() if OBJECT_DETECTOR else 'disabled'),
                     "vehicle_verifier_status": getattr(OBJECT_DETECTOR.remote_shadow, 'status', 'remote') if OBJECT_DETECTOR and OBJECT_DETECTOR.remote_shadow else 'disabled',
                     "preview_enabled": worker.preview_enabled,
                     "started_at": worker.started_at,
@@ -228,6 +235,10 @@ class WebAppState:
 
 
 APP_STATE = WebAppState()
+CAMERA_REGISTRY = CameraRegistry()
+SUPERVISOR_STOP = threading.Event()
+ARCHIVE_MANAGER = None
+ARCHIVE_ENABLED = os.getenv("MEDIA_ARCHIVE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
 
 def configure_logging():
@@ -365,6 +376,7 @@ def run_camera_worker(worker, stream, settings, sensitivity, excluded_areas=None
             object_status_callback=lambda value: update_object_status(worker, value),
             object_source_id=worker.source_id,
             object_result_callback=worker.record_objects,
+            heartbeat_callback=lambda now: setattr(worker, 'last_frame_at', now),
         )
     except Exception as exc:
         logging.exception("Browser stream failed: %s", worker.label)
@@ -374,6 +386,65 @@ def run_camera_worker(worker, stream, settings, sensitivity, excluded_areas=None
         with worker.condition:
             worker.condition.notify_all()
         APP_STATE.remove_worker(worker.source_id)
+
+
+def start_camera(payload, restore=False):
+    settings = payload.get("settings", {})
+    if not isinstance(settings, dict) or not isinstance(payload.get("stream", {}), dict):
+        raise ValueError("Invalid camera settings")
+    stream = stream_from_payload(payload.get("stream", {}))
+    if not stream.stream_id:
+        raise ValueError("stream_id is required")
+    sensitivity = parse_sensitivity(payload.get("sensitivity"))
+    algorithm = payload.get("motion_algorithm", "difference")
+    if algorithm not in ("difference", "background"):
+        raise ValueError("Invalid motion detection method.")
+    exclusions = payload.get("excluded_areas")
+    if exclusions is None or restore:
+        exclusions = load_exclusion_map().get(stream.stream_id, [])
+    FrameDifferenceMotion.validate_exclusions(exclusions)
+    vehicle_area = load_vehicle_areas().get(stream.stream_id, LocalVehicleVerifier.default_crop(stream.stream_id))
+    worker = WorkerState(source_id=stream.stream_id, label=stream.label, stop_event=threading.Event(),
+                         thread=None, kind="camera", sensitivity=sensitivity,
+                         excluded_areas=exclusions, vehicle_area=vehicle_area)
+    worker.thread = threading.Thread(target=run_camera_worker,
+        args=(worker, stream, settings, sensitivity, exclusions, algorithm), daemon=True)
+    # Hold the state lock while checking intent, so a stop cannot race a restore.
+    with APP_STATE.lock:
+        if restore and stream.stream_id not in CAMERA_REGISTRY.read():
+            raise ValueError("Camera no longer selected")
+        if APP_STATE.get_worker(stream.stream_id):
+            raise ValueError("Camera is already running")
+        if not restore:
+            CAMERA_REGISTRY.put(stream.stream_id, {"stream": stream_to_json(stream), "settings": settings,
+                "sensitivity": sensitivity, "motion_algorithm": algorithm})
+        APP_STATE.add_worker(worker)
+        try:
+            if OBJECT_DETECTOR and isinstance(OBJECT_DETECTOR.remote_shadow, LocalVehicleVerifier):
+                OBJECT_DETECTOR.remote_shadow.set_crop(worker.source_id, vehicle_area)
+            worker.thread.start()
+        except Exception:
+            APP_STATE.remove_worker(worker.source_id)
+            raise
+    return worker
+
+
+def supervise_cameras():
+    while not SUPERVISOR_STOP.is_set():
+        try:
+            selected = CAMERA_REGISTRY.read()
+            for source_id, payload in selected.items():
+                if SUPERVISOR_STOP.is_set():
+                    break
+                if APP_STATE.get_worker(source_id) is None:
+                    try:
+                        start_camera(payload, restore=True)
+                    except Exception as exc:
+                        # Camera settings can contain passwords; never log the payload or exception.
+                        logging.warning("Could not restore selected camera (%s)", type(exc).__name__)
+        except (OSError, ValueError) as exc:
+            logging.warning("Could not read camera registry (%s)", type(exc).__name__)
+        SUPERVISOR_STOP.wait(10)
 
 
 def read_log_tail(max_bytes=60000):
@@ -414,6 +485,10 @@ def list_saved_media(folder_key, limit=80):
             continue
 
         metadata = load_metadata(path) if folder_key in ('clips', 'object_clips') else None
+        delivery_status = None
+        if folder_key == 'object_clips':
+            import object_alerts
+            delivery_status = object_alerts.get_outbox().status(path)
         evidence = []
         for name in (metadata or {}).get('evidence', []):
             if isinstance(name, str) and Path(name).name == name and (OBJECT_OUTPUT_DIR / 'detection_frames' / name).is_file():
@@ -422,6 +497,7 @@ def list_saved_media(folder_key, limit=80):
             {
                 "name": path.name,
                 "detection_title": title_for_metadata(metadata) if folder_key == 'clips' else None,
+                "delivery_status": delivery_status,
                 "alert_reasons": sorted({str(event.get('reason')) for event in (metadata or {}).get('alert_events', []) if isinstance(event, dict) and event.get('reason')}),
                 "alert_decisions": sorted({str(reason) for reason in (metadata or {}).get('alert_decisions', []) if isinstance(reason, str)}),
                 "motion_associations": (metadata or {}).get('motion_associations', []),
@@ -436,6 +512,66 @@ def list_saved_media(folder_key, limit=80):
 
     items.sort(key=lambda item: item["modified"], reverse=True)
     return items[:limit]
+
+
+def list_archived_media(folder_key):
+    kind = {"clips": "motion", "object_clips": "object", "detection_frames": "image"}[folder_key]
+    result = list_archive(kind)
+    if result is None:
+        return None
+    items = []
+    for row in result.get("items", []):
+        try:
+            wrapper = json.loads(row.get("MetadataJson") or "{}")
+            metadata = wrapper.get("detections") or {}
+            media_id = str(row["MediaId"])
+            delivery_status = None
+            if folder_key == 'object_clips':
+                import object_alerts
+                delivery_status = object_alerts.get_outbox().status(OBJECT_OUTPUT_DIR / row["Filename"])
+            items.append({"name": row["Filename"], "delivery_status": delivery_status, "archive_id": media_id,
+                "review": row.get("Review"), "review_note": row.get("ReviewNote"),
+                "detection_title": title_for_metadata(metadata) if metadata else None,
+                "alert_reasons": sorted({str(e.get("reason")) for e in metadata.get("alert_events", []) if isinstance(e, dict) and e.get("reason")}),
+                "alert_decisions": metadata.get("alert_decisions", []),
+                "motion_associations": metadata.get("motion_associations", []),
+                "crop_comparisons": metadata.get("crop_comparisons", []),
+                "evidence": [{"name": name, "url": "/archive-image/" + quote(name, safe="")} for name in metadata.get("evidence", []) if isinstance(name, str) and Path(name).name == name],
+                "size": row.get("SizeBytes", 0), "modified": row.get("CreatedAt", ""),
+                "url": "/archive-media/" + media_id, "type": MEDIA_FOLDERS[folder_key]["type"]})
+        except (KeyError, TypeError, ValueError):
+            logging.warning("Invalid archive record was skipped")
+    return items
+
+
+def sanitize_diagnostic(value):
+    if isinstance(value, dict):
+        return {key: sanitize_diagnostic(item) for key, item in value.items()
+                if not any(word in str(key).lower() for word in ('password', 'token', 'secret', 'url', 'credential', 'settings'))}
+    if isinstance(value, list):
+        return [sanitize_diagnostic(item) for item in value]
+    if isinstance(value, str):
+        value = re.sub(r'(?i)rtsp[s]?://[^\s]+', '[redacted stream]', value)
+        value = re.sub(r'(?i)https?://[^\s]+', '[redacted link]', value)
+        value = re.sub(r'(?i)(password|token|secret|sig|key)\s*[:=]\s*[^\s,;]+', r'\1=[redacted]', value)
+        return value
+    return value
+
+
+def diagnostic_bundle():
+    import object_alerts
+    data = {'generated_at': datetime.now().astimezone().isoformat(), 'cameras': APP_STATE.worker_summaries(),
+            'alerts': object_alerts.get_outbox().counts(),
+            'archive': ARCHIVE_MANAGER.outbox.counts() if ARCHIVE_MANAGER else None, 'media': {}}
+    for key in MEDIA_FOLDERS:
+        local = list_saved_media(key, limit=30)
+        remote = list_archived_media(key) if ARCHIVE_ENABLED else []
+        data['media'][key] = {'local': local, 'archive': remote}
+    payload = json.dumps(sanitize_diagnostic(data), indent=2, default=str).encode('utf-8')
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('diagnostics.json', payload)
+    return output.getvalue()
 
 
 def media_path_for_name(folder_key, filename):
@@ -472,6 +608,33 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             )
         if parsed.path == "/api/workers":
             return self.send_json({"workers": APP_STATE.worker_summaries()})
+        if parsed.path == "/api/diagnostics/export":
+            try:
+                data = diagnostic_bundle()
+            except (OSError, ValueError):
+                return self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", 'attachment; filename="security-camera-diagnostics.zip"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if parsed.path == "/api/health":
+            import shutil
+            try:
+                disk_free = shutil.disk_usage(OUTPUT_DIR if OUTPUT_DIR.exists() else Path.home()).free
+                archive = ARCHIVE_MANAGER.outbox.counts() if ARCHIVE_MANAGER else None
+                import object_alerts
+                alerts = object_alerts.get_outbox().counts()
+                selected = CAMERA_REGISTRY.read()
+                cameras = APP_STATE.worker_summaries()
+                active = {camera['source_id'] for camera in cameras}
+                return self.send_json({"disk_free_bytes": disk_free, "cameras": cameras,
+                    "selected_not_running": len(set(selected) - active), "archive_enabled": ARCHIVE_ENABLED, "archive": archive, "alerts": alerts})
+            except (OSError, ValueError):
+                return self.send_json({"error": "Health status unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
         if parsed.path == "/api/logs":
             return self.send_json({"text": read_log_tail()})
         if parsed.path == "/api/media":
@@ -480,11 +643,17 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             folder = media_folder_config(folder_key)
             if folder is None:
                 return self.send_json({"error": "Unknown media folder"}, HTTPStatus.BAD_REQUEST)
+            archived = list_archived_media(folder_key) if ARCHIVE_ENABLED else []
+            local_items = list_saved_media(folder_key)
+            archived_names = {item['name'] for item in (archived or [])}
+            combined = [item for item in local_items if item['name'] not in archived_names] + (archived or [])
+            combined.sort(key=lambda item: item.get("modified", ""), reverse=True)
             return self.send_json(
                 {
                     "folder": folder_key,
                     "label": folder["label"],
-                    "items": list_saved_media(folder_key),
+                    "archive_unavailable": ARCHIVE_ENABLED and archived is None,
+                    "items": combined[:100],
                     "folders": [
                         {"key": key, "label": config["label"], "type": config["type"]}
                         for key, config in MEDIA_FOLDERS.items()
@@ -493,6 +662,37 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             )
         if parsed.path == "/api/clips":
             return self.send_json({"clips": list_saved_media("clips")})
+        if parsed.path.startswith("/archive-image/"):
+            name = unquote(parsed.path[len("/archive-image/"):])
+            if not name or Path(name).name != name:
+                return self.send_error(HTTPStatus.BAD_REQUEST)
+            local = media_path_for_name("detection_frames", name)
+            if local:
+                return self.send_media_file("detection_frames", name)
+            result = archive_request("/archive/image-by-name/" + quote(name, safe="") + "/read")
+            url = result.get("read_url") if result else None
+            if not url or not url.startswith("https://"):
+                return self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", url)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if parsed.path.startswith("/archive-media/"):
+            import uuid
+            try:
+                media_id = str(uuid.UUID(parsed.path[len("/archive-media/"):]))
+            except ValueError:
+                return self.send_error(HTTPStatus.BAD_REQUEST)
+            result = archive_request(f"/archive/{media_id}/read")
+            url = result.get("read_url") if result else None
+            if not url or not url.startswith("https://"):
+                return self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", url)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         if parsed.path.startswith("/media/"):
             media_path = parsed.path[len("/media/"):]
             folder_key, _separator, filename = media_path.partition("/")
@@ -507,6 +707,17 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/archive/review":
+            import uuid
+            payload = self.read_json()
+            try:
+                media_id = str(uuid.UUID(payload.get("media_id", "")))
+            except (ValueError, AttributeError):
+                return self.send_json({"error": "Invalid media ID"}, HTTPStatus.BAD_REQUEST)
+            result = archive_request(f"/archive/{media_id}/review", {"review": payload.get("review"), "note": payload.get("note")})
+            if result is None:
+                return self.send_json({"error": "Could not save review"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return self.send_json(result)
         if parsed.path == "/api/scan":
             return self.handle_scan()
         if parsed.path == "/api/stream/start":
@@ -534,51 +745,13 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         self.send_json({"streams": [stream_to_json(stream) for stream in streams], "messages": messages})
 
     def handle_stream_start(self):
-        payload = self.read_json()
-        settings = payload.get("settings", {})
-        stream = stream_from_payload(payload.get("stream", {}))
-        if not stream.stream_id:
-            return self.send_json({"error": "stream_id is required"}, HTTPStatus.BAD_REQUEST)
-
-        sensitivity = parse_sensitivity(payload.get("sensitivity"))
-        algorithm = payload.get("motion_algorithm", "difference")
-        if algorithm not in ("difference", "background"):
-            return self.send_json({"error": "Invalid motion detection method."}, HTTPStatus.BAD_REQUEST)
         try:
-            exclusions = payload.get("excluded_areas")
-            if exclusions is None:
-                exclusions = load_exclusion_map().get(stream.stream_id, [])
-            FrameDifferenceMotion.validate_exclusions(exclusions)
-            vehicle_area = load_vehicle_areas().get(stream.stream_id, LocalVehicleVerifier.default_crop(stream.stream_id))
-        except (ValueError, OSError) as exc:
-            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-
-        stop_event = threading.Event()
-        worker = WorkerState(
-            source_id=stream.stream_id,
-            label=stream.label,
-            stop_event=stop_event,
-            thread=None,
-            kind="camera",
-            sensitivity=sensitivity,
-            excluded_areas=exclusions,
-            vehicle_area=vehicle_area,
-        )
-        thread = threading.Thread(
-            target=run_camera_worker,
-            args=(worker, stream, settings, sensitivity, exclusions, algorithm),
-            daemon=True,
-        )
-        worker.thread = thread
-
-        try:
-            APP_STATE.add_worker(worker)
+            worker = start_camera(self.read_json())
         except ValueError as exc:
-            return self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
-
-        if OBJECT_DETECTOR and isinstance(OBJECT_DETECTOR.remote_shadow, LocalVehicleVerifier):
-            OBJECT_DETECTOR.remote_shadow.set_crop(worker.source_id, vehicle_area)
-        thread.start()
+            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except OSError:
+            logging.exception("Could not persist camera selection")
+            return self.send_json({"error": "Could not save camera selection."}, HTTPStatus.INTERNAL_SERVER_ERROR)
         self.send_json({"worker": {"source_id": worker.source_id, "label": worker.label}})
 
     def handle_stream_exclusions(self):
@@ -620,9 +793,17 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
     def handle_stream_stop(self):
         payload = self.read_json()
         source_id = str(payload.get("source_id", "")).strip()
-        worker = APP_STATE.get_worker(source_id)
-        if worker is None:
-            return self.send_json({"stopped": False})
+        with APP_STATE.lock:
+            try:
+                CAMERA_REGISTRY.remove(source_id)
+            except (OSError, ValueError):
+                logging.exception("Could not update camera selection")
+                return self.send_json({"error": "Could not save camera selection."}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            worker = APP_STATE.get_worker(source_id)
+            if worker is None:
+                return self.send_json({"stopped": False})
+            worker.status = "stopping"
+            worker.stop_event.set()
 
         worker.status = "stopping"
         worker.stop_event.set()
@@ -1151,6 +1332,8 @@ INDEX_HTML = r"""<!doctype html>
   <header>
     <h1>Motion Detection Console</h1>
     <div id="connectionStatus">Idle</div>
+    <div id="healthStatus" role="status"></div>
+    <a href="/api/diagnostics/export">Download diagnostics</a>
   </header>
 
   <main>
@@ -1399,11 +1582,16 @@ INDEX_HTML = r"""<!doctype html>
         <div class="clip-item">
           <div class="clip-title">${escapeHtml(item.name)}${item.detection_title ? ` — ${escapeHtml(item.detection_title)}` : ''}</div>
           <div class="clip-meta">${escapeHtml(formatDateTime(item.modified))} · ${escapeHtml(formatBytes(item.size))}</div>
+          ${item.delivery_status ? `<div class="clip-meta">WhatsApp queue: ${escapeHtml(item.delivery_status)}${item.delivery_status === 'accepted' ? ' (provider accepted; delivery not confirmed)' : ''}</div>` : ''}
           ${(item.alert_reasons || []).length ? `<div class="clip-meta">Alert eligible: ${escapeHtml(item.alert_reasons.join('; '))}</div>` : ''}
           ${(item.alert_decisions || []).length ? `<div class="clip-meta">Detection checks: ${escapeHtml(item.alert_decisions.join('; '))}</div>` : ''}
           ${(item.motion_associations || []).length ? `<div class="clip-meta">Motion association (test only): ${escapeHtml([...new Set(item.motion_associations.map(a => `${a.label}: ${a.status}`))].join('; '))}</div>` : ''}
           ${(item.crop_comparisons || []).length ? `<div class="clip-meta">Motion gate: ${escapeHtml(motionGateSummary(item.crop_comparisons))}</div>` : ''}
           ${mediaPreviewHtml(item)}
+          ${item.archive_id ? `<div class="clip-meta">Cloud archive${item.review ? ` · Review: ${escapeHtml(item.review)}` : ''}</div>
+          <div class="clip-actions"><button data-review-id="${escapeAttribute(item.archive_id)}" data-review="correct">Correct</button>
+          <button data-review-id="${escapeAttribute(item.archive_id)}" data-review="false_alarm">False alarm</button>
+          <button data-review-id="${escapeAttribute(item.archive_id)}" data-review="missed">Missed</button></div>` : ''}
           <div class="clip-actions">
             <a href="${escapeAttribute(item.url)}" download>Download</a>
             <a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer">Open</a>
@@ -1753,6 +1941,26 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function pollHealth() {
+      try {
+        const response = await fetch('/api/health');
+        if (!response.ok) throw new Error('unavailable');
+        const health = await response.json();
+        const warnings = [];
+        if (health.selected_not_running) warnings.push(`${health.selected_not_running} selected camera(s) stopped`);
+        for (const camera of health.cameras || []) {
+          if (camera.frame_age_seconds > 30) warnings.push(`${camera.label}: no recent frames`);
+          if (['error', 'disabled', 'stalled', 'degraded'].includes(camera.object_detection_status)) warnings.push(`${camera.label}: object detection ${camera.object_detection_status}`);
+          if ((camera.status || '').toLowerCase().includes('paused')) warnings.push(`${camera.label}: ${camera.status}`);
+        }
+        if (health.disk_free_bytes < 2147483648) warnings.push('Low disk space');
+        if (health.alerts && health.alerts.unknown) warnings.push(`${health.alerts.unknown} WhatsApp alert(s) have an unknown outcome`);
+        if (!health.archive_enabled) warnings.push('Cloud archive is disabled');
+        if (health.archive && health.archive.failed) warnings.push(`${health.archive.failed} archive upload(s) need retry`);
+        $('healthStatus').textContent = warnings.length ? warnings.join(' · ') : 'System health: no warnings';
+      } catch (_error) { $('healthStatus').textContent = 'System health unavailable'; }
+    }
+
     async function loadLogs() {
       const pane = $("appLogs");
       const shouldStickToBottom = $("autoScrollLogs").checked ||
@@ -1776,12 +1984,22 @@ INDEX_HTML = r"""<!doctype html>
         state.mediaFolders = data.folders || state.mediaFolders;
         state.mediaItems = data.items || [];
         renderMedia();
+        if (data.archive_unavailable) $("clipList").insertAdjacentHTML('afterbegin', '<div class="status">Cloud archive is temporarily unavailable; showing local media.</div>');
       } catch (_error) {
         renderMediaTabs();
         $("clipList").innerHTML = `<div class="status">Could not load saved media.</div>`;
       }
     }
 
+    $("clipList").addEventListener("click", async (event) => {
+      const button = event.target.closest('[data-review-id]');
+      if (!button) return;
+      button.disabled = true;
+      try {
+        await jsonFetch('/api/archive/review', {media_id:button.dataset.reviewId, review:button.dataset.review, note:''});
+        await loadMedia();
+      } catch (error) { alert(error.message); button.disabled = false; }
+    });
     $("scanButton").addEventListener("click", scanStreams);
     $("manualButton").addEventListener("click", addManualChannel);
     $("refreshLogsButton").addEventListener("click", loadLogs);
@@ -1816,6 +2034,8 @@ INDEX_HTML = r"""<!doctype html>
     loadDefaults();
     loadLogs();
     loadMedia();
+    pollHealth();
+    setInterval(pollHealth, 10000);
     setInterval(pollWorkers, 3000);
     setInterval(loadLogs, 3000);
   </script>
@@ -1839,6 +2059,7 @@ def stop_all_workers():
 
 
 def main(argv=None):
+    global ARCHIVE_MANAGER
     configure_logging()
     load_dotenv()
     args = parse_args(argv)
@@ -1852,12 +2073,34 @@ def main(argv=None):
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
+    import object_alerts
+    if ARCHIVE_ENABLED:
+        from archive_manager import ArchiveManager
+        ARCHIVE_MANAGER = ArchiveManager(Path.home() / '.local/state/securitycamera/archive.db',
+            {'motion': OUTPUT_DIR, 'object': OBJECT_OUTPUT_DIR,
+             'image': OBJECT_OUTPUT_DIR / 'detection_frames'},
+            alert_status=object_alerts.get_outbox().status,
+            alerts_enabled=os.getenv('WHATSAPP_OBJECT_ALERTS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on'))
+        ARCHIVE_MANAGER.recover_interrupted()
+        ARCHIVE_MANAGER.start()
+    if os.getenv('WHATSAPP_OBJECT_ALERTS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on'):
+        object_alerts.start_alert_worker(on_accepted=ARCHIVE_MANAGER.outbox.release if ARCHIVE_MANAGER else None)
+    SUPERVISOR_STOP.clear()
+    supervisor = threading.Thread(target=supervise_cameras, daemon=True)
+    supervisor.start()
     logging.info("Security camera web console listening on http://%s:%s", args.host, args.port)
     try:
         server.serve_forever()
     finally:
+        SUPERVISOR_STOP.set()
+        supervisor.join(timeout=2)
+        workers = list(APP_STATE.workers.values())
         stop_all_workers()
+        for worker in workers:
+            worker.thread.join(timeout=30)
         server.server_close()
+        if ARCHIVE_MANAGER:
+            ARCHIVE_MANAGER.stop()
     return 0
 
 

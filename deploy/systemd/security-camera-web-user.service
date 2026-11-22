@@ -1,0 +1,16 @@
+[Unit]
+Description=Security camera web application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/securitycamera
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/securitycamera/.venv/bin/python %h/securitycamera/webapp.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

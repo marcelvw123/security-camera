@@ -132,6 +132,30 @@ class MotionCaptureTests(unittest.TestCase):
                     core.run_detection('rtsp://test', 'camera', set(), stop, motion_algorithm='difference')
                 self.assertEqual(create.called, fails)
 
+    def test_clip_limit_does_not_suppress_object_motion_gate(self):
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        cap, recorder = MagicMock(), MagicMock()
+        cap.get.return_value = 20
+        cap.read.return_value = (True, frame)
+        recorder.observe.return_value = []
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / 'motion_old.mp4').write_bytes(b'x')
+            stop = MagicMock(side_effect=[False, False, True])
+            ticks = iter(range(1000))
+            with patch.object(core, 'OUTPUT_DIR', Path(directory)), \
+                 patch.object(core, 'MOTION_MAX_CLIPS', 1), \
+                 patch.object(core, 'MOTION_WARMUP_SECONDS', 0), \
+                 patch.object(core, 'MOTION_MIN_FREE_MB', 0), \
+                 patch.object(core, 'open_rtsp_capture', return_value=cap), \
+                 patch.object(core, 'detect_motion', return_value=[(2, 2, 20, 20)]), \
+                 patch.object(core, 'create_video_writer') as writer, \
+                 patch('object_detection.ObjectClipRecorder', return_value=recorder), \
+                 patch.object(core.time, 'monotonic', side_effect=lambda: next(ticks)):
+                core.run_detection('rtsp://test', 'camera', set(), stop, upload_on_motion=True,
+                                   object_detector=MagicMock(), motion_algorithm='background')
+            writer.assert_not_called()
+            self.assertTrue(any(call.args[2] for call in recorder.observe.call_args_list))
+
     def test_lowest_sensitivity_uses_higher_pixel_threshold(self):
         with patch.object(core, 'FrameDifferenceMotion') as difference:
             core.run_detection('rtsp://test', 'camera', set(), lambda: True,

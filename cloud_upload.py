@@ -1,4 +1,5 @@
 import json
+import http.client
 import logging
 import mimetypes
 import os
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from app_config import load_dotenv
@@ -103,7 +104,7 @@ def upload_file(
             return False
         if 'whatsapp_alert' in result:
             logging.info('WhatsApp alert result for clip_id=%s: %s', clip_id, result['whatsapp_alert'])
-        if metadata.get('scenario') == 'object_detected' and result.get('whatsapp_alert') not in ('sent', 'partial_failed'):
+        if metadata.get('scenario') == 'object_detected' and result.get('whatsapp_alert') != 'sent':
             logging.error('WhatsApp object alert not confirmed for clip_id=%s: %s', clip_id, result.get('whatsapp_alert', 'missing result'))
             return False
 
@@ -176,31 +177,32 @@ def post_json(config: CloudUploadConfig, endpoint: str, payload: Dict[str, Any])
 
 
 def upload_to_blob(upload_url: str, clip_file: Path, content_type: str) -> bool:
+    # Stream the video: reading a whole recording into memory can exhaust a Pi.
+    parsed = urlsplit(upload_url)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+        logging.warning('Blob upload URL was invalid')
+        return False
+    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=DEFAULT_TIMEOUT_SECONDS)
     try:
-        logging.info("Uploading clip to Azure Blob Storage: %s", clip_file)
-        with clip_file.open("rb") as file_handle:
-            request = Request(
-                upload_url,
-                data=file_handle.read(),
-                headers={
-                    "x-ms-blob-type": "BlockBlob",
-                    "Content-Type": content_type,
-                },
-                method="PUT",
-            )
-            with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-                success = 200 <= response.status < 300
-                logging.info("Azure Blob upload response for %s: HTTP %s", clip_file, response.status)
-                return success
-    except HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        logging.warning("Azure Blob upload error %s: %s", exc.code, error_body)
-    except URLError as exc:
-        logging.warning("Azure Blob upload failed: %s", exc.reason)
-    except TimeoutError:
-        logging.warning("Azure Blob upload timed out")
-
-    return False
+        target = parsed.path + ('?' + parsed.query if parsed.query else '')
+        connection.putrequest('PUT', target)
+        connection.putheader('Content-Length', str(clip_file.stat().st_size))
+        connection.putheader('Content-Type', content_type)
+        connection.putheader('x-ms-blob-type', 'BlockBlob')
+        connection.endheaders()
+        with clip_file.open('rb') as source:
+            while chunk := source.read(1024 * 1024):
+                connection.send(chunk)
+        response = connection.getresponse()
+        response.read()
+        logging.info('Azure Blob upload response: HTTP %s', response.status)
+        return 200 <= response.status < 300
+    except (OSError, http.client.HTTPException):
+        # Provider exceptions may contain the signed URL; do not log them.
+        logging.warning('Azure Blob upload failed')
+        return False
+    finally:
+        connection.close()
 
 
 def complete_clip_upload(

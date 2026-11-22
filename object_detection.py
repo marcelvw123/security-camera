@@ -91,6 +91,7 @@ class SharedObjectDetector:
         self.last_crop_submitted = {}
         self.generations = {}
         self.processing_camera = None
+        self.processing_started = None
         self.status = 'starting'
         # All inference belongs to this app and follows the motion-crop gate.
         self.remote_shadow = None
@@ -136,6 +137,11 @@ class SharedObjectDetector:
             processing = self.processing_camera == camera
         return processing or bool(self.remote_shadow and self.remote_shadow.is_processing(camera))
 
+    def health(self):
+        with self.condition:
+            stalled = self.processing_started is not None and time.monotonic() - self.processing_started > 60
+            return 'error' if not self.thread.is_alive() else ('stalled' if stalled else self.status)
+
     def _run(self):
         try:
             import torch
@@ -161,6 +167,7 @@ class SharedObjectDetector:
                     self.condition.wait_for(lambda: bool(self.pending))
                     camera, (frame, timestamp, generation, crop, regions, motion_pair, captured_at) = self.pending.popitem(last=False)
                     self.processing_camera = camera
+                    self.processing_started = time.monotonic()
                 if camera not in gates or gates[camera][0] != generation:
                     gates[camera] = (generation, MovingObjectGate())
                 try:
@@ -177,6 +184,7 @@ class SharedObjectDetector:
                                                   'error': 'motion-gated inference failed'}
                 with self.condition:
                     self.processing_camera = None
+                    self.processing_started = None
                     if generation == self.generations.get(camera, 0):
                         self.results[camera] = (timestamp, frame.shape[1], detections,
                                                 frame if detections else None, crop_result)
@@ -185,6 +193,7 @@ class SharedObjectDetector:
             with self.condition:
                 self.status = 'error'
                 self.processing_camera = None
+                self.processing_started = None
                 self.pending.clear()
 
 

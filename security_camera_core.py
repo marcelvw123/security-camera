@@ -1158,6 +1158,7 @@ def run_detection(
     object_status_callback=None,
     object_source_id=None,
     object_result_callback=None,
+    heartbeat_callback=None,
 ):
     # This branch deliberately runs motion capture only, regardless of legacy settings.
     upload_on_motion = True
@@ -1368,6 +1369,8 @@ def run_detection(
             consecutive_read_failures = 0
 
             loop_now = time.monotonic()
+            if heartbeat_callback:
+                heartbeat_callback(loop_now)
             preroll.add(loop_now, frame)
             # Keep the background model and live motion display current during recording.
             skip_detection_for_recording = False
@@ -1476,6 +1479,7 @@ def run_detection(
 
             # Never delete user footage to make room. Stop creating new clips at the
             # configured cap or reserve, while leaving preview and detection running.
+            recording_blocked = False
             if writer is None and motion_detected:
                 clip_count = sum(1 for path in OUTPUT_DIR.glob("motion_*")
                                  if path.is_file() and path.suffix.lower() in ('.mp4', '.mov', '.avi', '.mkv', '.m4v'))
@@ -1485,10 +1489,10 @@ def run_detection(
                         status_callback("Motion recording paused: clip limit or disk reserve reached")
                         logging.warning("Motion recording paused: count=%s limit=%s enough_space=%s", clip_count, MOTION_MAX_CLIPS, enough_space)
                         storage_warning_at = loop_now + 60
-                    motion_detected = False
+                    recording_blocked = True
                     pending_trigger_id = None
 
-            if writer is None and (matched_objects or (upload_on_motion and motion_detected)):
+            if writer is None and not recording_blocked and (matched_objects or (upload_on_motion and motion_detected)):
                 if pending_trigger_id is None:
                     pending_trigger_id = new_trigger_id()
                 if not upload_on_motion:

@@ -27,7 +27,9 @@ class MotionWebTests(unittest.TestCase):
         handler.read_json.return_value = {'stream': {'stream_id': 'camera:1'}}
         with tempfile.TemporaryDirectory() as directory, patch.object(webapp, 'VEHICLE_AREAS_FILE', Path(directory)/'areas.json'):
             webapp.save_vehicle_area('camera:1', [.1,.2,.3,.4])
-            with patch.object(webapp, 'APP_STATE'), patch.object(webapp.threading, 'Thread') as thread, patch.object(webapp, 'OBJECT_DETECTOR', None):
+            with patch.object(webapp, 'APP_STATE', webapp.WebAppState()), \
+                 patch.object(webapp, 'CAMERA_REGISTRY', webapp.CameraRegistry(Path(directory)/'registry.json')), \
+                 patch.object(webapp.threading, 'Thread') as thread, patch.object(webapp, 'OBJECT_DETECTOR', None):
                 webapp.SecurityCameraWebHandler.handle_stream_start(handler)
             self.assertEqual(thread.call_args.kwargs['args'][0].current_vehicle_area(), [.1,.2,.3,.4])
 
@@ -90,7 +92,10 @@ class MotionWebTests(unittest.TestCase):
         handler=MagicMock()
         handler.read_json.return_value={'stream':{'stream_id':'camera:1','label':'Camera 1'},
             'sensitivity':4,'motion_algorithm':'difference','excluded_areas':[[.1,.2,.3,.4]]}
-        with patch.object(webapp, 'APP_STATE'), patch.object(webapp.threading, 'Thread') as thread:
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(webapp, 'APP_STATE', webapp.WebAppState()), \
+             patch.object(webapp, 'CAMERA_REGISTRY', webapp.CameraRegistry(Path(directory)/'registry.json')), \
+             patch.object(webapp.threading, 'Thread') as thread, patch.object(webapp, 'OBJECT_DETECTOR', None):
             webapp.SecurityCameraWebHandler.handle_stream_start(handler)
         args=thread.call_args.kwargs['args']
         self.assertEqual(args[-2],[[.1,.2,.3,.4]])

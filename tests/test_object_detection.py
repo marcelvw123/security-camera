@@ -85,3 +85,19 @@ class ObjectClipTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class DetectorHealthTests(unittest.TestCase):
+    def test_reports_dead_or_stalled_worker(self):
+        import threading
+        from unittest.mock import MagicMock, patch
+        from object_detection import SharedObjectDetector
+        detector = SharedObjectDetector.__new__(SharedObjectDetector)
+        detector.condition = threading.Condition()
+        detector.thread = MagicMock()
+        detector.thread.is_alive.return_value = True
+        detector.processing_started = 10
+        detector.status = 'ready'
+        with patch('object_detection.time.monotonic', return_value=71):
+            self.assertEqual(detector.health(), 'stalled')
+        detector.thread.is_alive.return_value = False
+        self.assertEqual(detector.health(), 'error')
