@@ -19,7 +19,7 @@ class ActiveMotionGateTests(unittest.TestCase):
 
     def test_full_frame_runs_after_moving_crop(self):
         frame=np.zeros((100,100,3),np.uint8);model=MagicMock();gate=MagicMock()
-        gate.observe.return_value=[{'label':'person','qualified':True}]
+        gate.observe.return_value=[{'label':'person','box':[10,10,30,70],'qualified':True}]
         model.names={5:'bus'}
         model.predict.return_value=[SimpleNamespace(boxes=SimpleNamespace(xyxy=[[50,20,90,80]],conf=[.8],cls=[5]))]
         crop=[{'label':'person','confidence':.9,'box':[10,10,30,70]}]
@@ -55,3 +55,15 @@ class ActiveMotionGateTests(unittest.TestCase):
             recorder=ObjectClipRecorder(detector,'camera',directory,MagicMock(),MagicMock(),MagicMock(),0)
             recorder.observe(np.zeros((100,100,3),np.uint8),1,False)
             detector.submit.assert_not_called()
+
+    def test_small_unconfirmed_person_does_not_pass_gate(self):
+        frame=np.zeros((720,1280,3),np.uint8);model=MagicMock();gate=MagicMock()
+        bird={'label':'person','confidence':.61,'box':[540,440,548,458]}
+        pole={'label':'person','confidence':.65,'box':[588,354,608,389]}
+        gate.observe.return_value=[{**bird,'qualified':True},{**pole,'qualified':False}]
+        model.predict.return_value=[SimpleNamespace(boxes=SimpleNamespace(xyxy=[],conf=[],cls=[]))]
+        with patch('motion_crop.detect_motion_crop',return_value=[bird,pole]):
+            detections,details=process_motion_frame(model,frame,(400,300,650,500),[(540,440,8,18)],None,gate,1)
+        self.assertEqual(detections,[])
+        self.assertFalse(any(item['qualified'] for item in details['moving_gate']))
+        self.assertEqual(details['moving_gate'][0]['reason'],'small person not confirmed in full frame')

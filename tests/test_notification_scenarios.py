@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import numpy as np
-from notification_scenarios import count_people, evaluate_person_scenario
+from notification_scenarios import count_people, crop_person_supported, evaluate_person_scenario
 from object_detection import ObjectClipRecorder
 
 
@@ -32,6 +32,39 @@ class NotificationScenarioTests(unittest.TestCase):
         self.assertEqual(count_people(detections),1)
         self.assertIsNone(evaluate_person_scenario(detections,'2026-11-20T12:00:00+02:00'))
 
+    def test_small_crop_needs_full_frame_corroboration(self):
+        bird=person([540,440,548,458]);full=person([539,438,550,460])
+        self.assertFalse(crop_person_supported(bird,[],720))
+        self.assertTrue(crop_person_supported(bird,[full],720))
+        self.assertTrue(crop_person_supported(person([100,100,125,150]),[],720))
+
+    def test_daytime_two_person_alert_requires_two_full_frame_people(self):
+        frame=np.zeros((100,100,3),np.uint8);detector=MagicMock()
+        detector.take.return_value=(1,100,[('person',[5,5,20,50],.9),('person',[25,5,40,50],.8)],frame,
+          {'moving_gate':[{'label':'person','qualified':True}], 'full_frame_ran':True,
+           'captured_at':'2026-11-20T12:00:00+02:00', 'full_frame_detections':[person([5,5,20,50])]})
+        with tempfile.TemporaryDirectory() as folder, patch('shutil.disk_usage',return_value=SimpleNamespace(free=1000)), patch('motion_preroll.AsyncPreRollWriter') as writer:
+            writer.return_value.path=Path(folder)/'object.mp4'
+            recorder=ObjectClipRecorder(detector,'camera',folder,MagicMock(),MagicMock(),MagicMock(),0)
+            checks=recorder.observe(frame,1,True,[(5,5,15,45)])
+            self.assertEqual(checks[0][3],[])
+            recorder.stop()
+
+    def test_unavailable_group_verifier_suppresses_group_alert(self):
+        frame=np.zeros((100,100,3),np.uint8);detector=MagicMock()
+        people=[person([5,5,20,50]),person([25,5,40,50])]
+        detector.take.return_value=(1,100,[('person',p['box'],p['confidence']) for p in people],frame,
+          {'moving_gate':[{'label':'person','qualified':True}], 'full_frame_ran':True,
+           'captured_at':'2026-11-20T12:00:00+02:00', 'full_frame_detections':people,
+           'person_verification_error':'person verifier unavailable'})
+        with tempfile.TemporaryDirectory() as folder, patch('shutil.disk_usage',return_value=SimpleNamespace(free=1000)), patch('motion_preroll.AsyncPreRollWriter') as writer:
+            writer.return_value.path=Path(folder)/'object.mp4'
+            recorder=ObjectClipRecorder(detector,'camera',folder,MagicMock(),MagicMock(),MagicMock(),0)
+            checks=recorder.observe(frame,1,True,[(5,5,15,45)])
+            self.assertEqual(checks[0][3],[])
+            self.assertIn('person verification unavailable; group alert suppressed',checks[0][4])
+            recorder.stop()
+
     def test_missing_or_naive_time_does_not_trigger(self):
         self.assertIsNone(evaluate_person_scenario([person([0,0,10,20])],None))
         self.assertIsNone(evaluate_person_scenario([person([0,0,10,20])],datetime(2026,11,20,23)))
@@ -39,7 +72,9 @@ class NotificationScenarioTests(unittest.TestCase):
     def test_scene_rules_use_people_even_when_moving_vehicle_triggered_scene(self):
         frame=np.zeros((100,100,3),np.uint8);detector=MagicMock()
         detector.take.return_value=(1,100,[('person',[5,5,20,50],.9),('person',[25,5,40,50],.8),('car',[45,10,90,50],.9)],frame,
-          {'moving_gate':[{'label':'car','qualified':True}], 'full_frame_ran':True, 'captured_at':'2026-11-20T12:00:00+02:00'})
+          {'moving_gate':[{'label':'car','qualified':True}], 'full_frame_ran':True, 'captured_at':'2026-11-20T12:00:00+02:00',
+           'full_frame_detections':[person([5,5,20,50]),person([25,5,40,50])],
+           'verified_full_people':[person([5,5,20,50]),person([25,5,40,50])]})
         with tempfile.TemporaryDirectory() as folder, patch('shutil.disk_usage',return_value=SimpleNamespace(free=1000)), patch('motion_preroll.AsyncPreRollWriter') as writer:
             writer.return_value.path=Path(folder)/'object.mp4'
             recorder=ObjectClipRecorder(detector,'camera',folder,MagicMock(),MagicMock(),MagicMock(),0)
@@ -63,8 +98,10 @@ class NotificationScenarioTests(unittest.TestCase):
         frame=np.zeros((100,100,3),np.uint8);detector=MagicMock()
         crop={'moving_gate':[{'label':'person','qualified':True}], 'full_frame_ran':True,
               'captured_at':'2026-11-20T22:00:00+02:00'}
+        second_crop={**crop,'full_frame_detections':[person([5,5,20,50]),person([25,5,40,50])],
+                     'verified_full_people':[person([5,5,20,50]),person([25,5,40,50])]}
         detector.take.side_effect=[(1,100,[('person',[5,5,20,50],.9)],frame,crop),
-                                   (2,100,[('person',[5,5,20,50],.9),('person',[25,5,40,50],.8)],frame,crop)]
+                                   (2,100,[('person',[5,5,20,50],.9),('person',[25,5,40,50],.8)],frame,second_crop)]
         with tempfile.TemporaryDirectory() as folder, patch('shutil.disk_usage',return_value=SimpleNamespace(free=1000)), patch('motion_preroll.AsyncPreRollWriter') as writer:
             writer.return_value.path=Path(folder)/'object.mp4'
             recorder=ObjectClipRecorder(detector,'camera',folder,MagicMock(),MagicMock(),MagicMock(),0)
@@ -90,7 +127,9 @@ class NotificationScenarioTests(unittest.TestCase):
                 if count==2:detections.append(('person',[25,5,40,50],.8))
                 detector=MagicMock()
                 detector.take.return_value=(1,100,detections,frame,{'moving_gate':[{'label':'person','qualified':True}],
-                                              'full_frame_ran':True,'captured_at':time})
+                                              'full_frame_ran':True,'captured_at':time,
+                                              'full_frame_detections':[person(d[1]) for d in detections],
+                                              'verified_full_people':[person(d[1]) for d in detections]})
                 recorder=ObjectClipRecorder(detector,'camera',folder,MagicMock(),MagicMock(),MagicMock(),0,
                                             alert_camera='Front camera')
                 recorder.observe(frame,1,True,[(5,5,15,45)])

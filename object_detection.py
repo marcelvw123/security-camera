@@ -145,8 +145,17 @@ class SharedObjectDetector:
             if not self.model_path.is_file():
                 raise FileNotFoundError('Object model file not found')
             model = YOLO(str(self.model_path))
+            verifier_path = self.model_path.parent / 'yolo11s.pt'
+            person_verifier = None
+            if verifier_path.is_file():
+                try:
+                    person_verifier = YOLO(str(verifier_path))
+                except Exception:
+                    logging.exception('Person verifier could not load; group notifications disabled')
+            else:
+                logging.warning('Person verifier missing; group notifications disabled: %s', verifier_path)
             gates = {}
-            self.status = 'ready'
+            self.status = 'ready' if person_verifier is not None else 'degraded'
             while True:
                 with self.condition:
                     self.condition.wait_for(lambda: bool(self.pending))
@@ -156,8 +165,12 @@ class SharedObjectDetector:
                     gates[camera] = (generation, MovingObjectGate())
                 try:
                     detections, crop_result = process_motion_frame(
-                        model, frame, crop, regions, motion_pair, gates[camera][1], timestamp)
+                        model, frame, crop, regions, motion_pair, gates[camera][1], timestamp, person_verifier)
                     crop_result['captured_at'] = captured_at
+                    if crop_result.get('person_verification_error'):
+                        self.status = 'degraded'
+                    elif 'person_verification' in crop_result:
+                        self.status = 'ready'
                 except Exception:
                     logging.exception('Motion-gated detection failed for %s', camera)
                     detections, crop_result = [], {'crop_box': list(crop), 'motion_regions': regions,
@@ -175,7 +188,7 @@ class SharedObjectDetector:
                 self.pending.clear()
 
 
-def process_motion_frame(model, frame, crop, regions, motion_pair, gate, timestamp):
+def process_motion_frame(model, frame, crop, regions, motion_pair, gate, timestamp, person_verifier=None):
     """Detect the motion crop first; run scene inference only after it qualifies."""
     from motion_crop import detect_motion_crop, merge_scene_detections
     from motion_flow import motion_flow_evidence
@@ -199,8 +212,30 @@ def process_motion_frame(model, frame, crop, regions, motion_pair, gate, timesta
                           imgsz=640, device='cpu', verbose=False)[0]
     full = [{'label': model.names[int(cls)], 'box': [float(v) for v in box], 'confidence': float(conf)}
             for box, conf, cls in zip(scene.boxes.xyxy, scene.boxes.conf, scene.boxes.cls)]
-    comparison['combined'] = merge_scene_detections(full, cropped)
+    from notification_scenarios import count_people, crop_person_supported
+    for item in gated:
+        if item['qualified'] and not crop_person_supported(item, full, height):
+            item.update(qualified=False, reason='small person not confirmed in full frame')
+    supported_crops = [item for item in cropped if crop_person_supported(item, full, height)]
+    comparison['full_frame_detections'] = full
+    comparison['combined'] = merge_scene_detections(full, supported_crops)
     comparison['full_frame_ran'] = True
+    if not any(item['qualified'] for item in gated):
+        return [], comparison
+    comparison['verified_full_people'] = []
+    if count_people(full) >= 2:
+        if person_verifier is None:
+            comparison['person_verification_error'] = 'person verifier unavailable'
+        else:
+            try:
+                from person_verifier import verify_scene_people
+                checked = verify_scene_people(person_verifier, frame, full)
+                comparison['person_verification'] = checked
+                comparison['verified_full_people'] = [
+                    {**item, 'box': item['verification_box']} for item in checked if item['verified']]
+            except Exception:
+                logging.exception('Person verification failed')
+                comparison['person_verification_error'] = 'person verification failed'
     return [(item['label'], item['box'], item['confidence']) for item in comparison['combined']], comparison
 
 class RemoteVehicleShadow:
@@ -431,8 +466,12 @@ class ObjectClipRecorder:
             # Scene rules are evaluated independently of the recording cooldown.
             # A moving vehicle may reveal two people in the same full frame.
             if qualified and (crop_result or {}).get('full_frame_ran'):
-                from notification_scenarios import evaluate_person_scenario
-                event = evaluate_person_scenario(boxes, crop_result.get('captured_at'))
+                from notification_scenarios import evaluate_person_scenario, scenario_people
+                if crop_result.get('person_verification_error'):
+                    decisions.append('person verification unavailable; group alert suppressed')
+                people = scenario_people(crop_result.get('full_frame_detections', []), boxes,
+                                         crop_result.get('verified_full_people', []))
+                event = evaluate_person_scenario(people, crop_result.get('captured_at'))
                 if event:
                     previous = self.last_scenario_alert.get(event['scenario'])
                     if previous is None or timestamp - previous >= 20:
