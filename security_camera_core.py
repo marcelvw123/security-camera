@@ -130,6 +130,7 @@ DETECTION_INTERVAL_SECONDS = float_env("DETECTION_INTERVAL_SECONDS", 0.5, min_va
 MOTION_WARMUP_SECONDS = float_env("MOTION_WARMUP_SECONDS", 5.0, min_value=0.0)
 MOTION_PREROLL_SECONDS = float_env("MOTION_PREROLL_SECONDS", 3.0, min_value=0.0, max_value=10.0)
 MOTION_QUIET_SECONDS = float_env("MOTION_QUIET_SECONDS", 5.0, min_value=0.5)
+DEFAULT_MOTION_RECORD_INTERVAL_SECONDS = 120
 MOTION_SHADOW_ENABLED = bool_env("MOTION_SHADOW_ENABLED", False)
 MOTION_ALGORITHM = os.getenv("MOTION_ALGORITHM", "background").strip().lower()
 MOTION_MAX_CLIPS = int_env("MOTION_MAX_CLIPS", 500, min_value=1)
@@ -1069,6 +1070,8 @@ def run_detection(
     replay=None,
     replay_progress_callback=None,
     replay_check_callback=None,
+    motion_record_interval_seconds=DEFAULT_MOTION_RECORD_INTERVAL_SECONDS,
+    motion_record_interval_provider=None,
 ):
     # This branch deliberately runs motion capture only, regardless of legacy settings.
     upload_on_motion = True
@@ -1106,6 +1109,8 @@ def run_detection(
     active_trigger_id = None
     pending_trigger_id = None
     clip_start_time = 0.0
+    last_motion_record_start = None
+    motion_clip_fixed_duration = False
     clip_detection_start = 0.0
     clip_end_time = 0.0
     next_clip_frame_time = 0.0
@@ -1326,6 +1331,8 @@ def run_detection(
                     replay_progress_callback(position, replay_duration)
 
             loop_now = time.monotonic()
+            record_interval = (motion_record_interval_provider() if motion_record_interval_provider
+                               else motion_record_interval_seconds)
             if heartbeat_callback:
                 heartbeat_callback(loop_now)
             preroll.add(loop_now, frame)
@@ -1365,13 +1372,15 @@ def run_detection(
                     replay_check_callback([{'motion_regions': [list(box) for box in motion_boxes], 'captured_at': replay_capture_at}])
                 if object_recorder is not None and loop_now >= motion_ready_at:
                     object_recorder.motion_association.add(loop_now, motion_boxes, frame.shape[1], frame.shape[0])
-                if writer is not None and motion_detected:
+                if writer is not None and motion_detected and not motion_clip_fixed_duration:
                     clip_end_time = max(clip_end_time, loop_now + MOTION_QUIET_SECONDS)
                 if shadow is not None:
                     shadow.observe(frame, loop_now, bool(raw_boxes), eligible=loop_now >= motion_ready_at)
 
                 if motion_detected:
-                    if writer is None and pending_trigger_id is None:
+                    if (writer is None and pending_trigger_id is None
+                            and (record_interval <= 0 or last_motion_record_start is None
+                                 or loop_now - last_motion_record_start >= record_interval)):
                         pending_trigger_id = new_trigger_id()
                         log_trigger_step(
                             pending_trigger_id,
@@ -1438,8 +1447,14 @@ def run_detection(
 
             # Never delete user footage to make room. Stop creating new clips at the
             # configured cap or reserve, while leaving preview and detection running.
-            recording_blocked = False
-            if writer is None and motion_detected:
+            # Only the motion recording is rate-limited; the motion signal below
+            # still reaches the independent object detector on every check.
+            recording_blocked = bool(writer is None and motion_detected and record_interval > 0
+                                     and last_motion_record_start is not None
+                                     and loop_now - last_motion_record_start < record_interval)
+            if recording_blocked:
+                pending_trigger_id = None
+            if writer is None and motion_detected and not recording_blocked:
                 clip_count = sum(1 for path in motion_output_dir.glob("motion_*")
                                  if path.is_file() and path.suffix.lower() in ('.mp4', '.mov', '.avi', '.mkv', '.m4v'))
                 enough_space = shutil.disk_usage(motion_output_dir).free >= MOTION_MIN_FREE_MB * 1024 * 1024
@@ -1488,6 +1503,8 @@ def run_detection(
                 pending_trigger_id = None
                 clip_detection_start = loop_now
                 clip_start_time = time.monotonic()
+                last_motion_record_start = clip_start_time
+                motion_clip_fixed_duration = record_interval > 0
                 clip_end_time = clip_start_time + CLIP_SECONDS
                 next_recording_space_check = clip_start_time + 5.0
                 next_clip_frame_time = clip_start_time

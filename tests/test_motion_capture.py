@@ -34,10 +34,47 @@ class MotionCaptureTests(unittest.TestCase):
                  patch.object(core, 'write_recording_frames_until', return_value=0), \
                  patch.object(core, 'finalize_recorded_clip') as finalize, \
                  patch.object(core.time, 'monotonic', side_effect=lambda: clock[0]):
-                core.run_detection('rtsp://test', 'camera', set(), lambda: clock[0] >= 13)
+                core.run_detection('rtsp://test', 'camera', set(), lambda: clock[0] >= 13, motion_record_interval_seconds=0)
             self.assertEqual(create.call_count, 1)
             self.assertEqual(finalize.call_count, 1)
             self.assertNotEqual(finalize.call_args.kwargs.get('reason'), 'stream_stopped')
+
+    def test_motion_recording_interval_keeps_object_checks_and_preroll_running(self):
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        cap, writer, recorder = MagicMock(), MagicMock(), MagicMock()
+        cap.get.return_value = 20
+        clock = [0.0]
+        starts = []
+        def read():
+            clock[0] += 1
+            return True, frame
+        cap.read.side_effect = read
+        recorder.observe.return_value = []
+        with tempfile.TemporaryDirectory() as directory:
+            writer.path = Path(directory) / 'motion_test.mp4'
+            def new_writer(*args):
+                starts.append(clock[0])
+                return writer
+            with patch.object(core, 'OUTPUT_DIR', Path(directory)), \
+                 patch.object(core, 'CLIP_SECONDS', 3), \
+                 patch.object(core, 'MOTION_WARMUP_SECONDS', 0), \
+                 patch.object(core, 'MOTION_MIN_FREE_MB', 0), \
+                 patch.object(core, 'open_rtsp_capture', return_value=cap), \
+                 patch.object(core, 'detect_motion', return_value=[(2, 2, 20, 20)]), \
+                 patch.object(core, 'create_video_writer', side_effect=new_writer), \
+                 patch.object(core, 'emit_recording_progress', return_value=0), \
+                 patch.object(core, 'write_recording_frames_until', return_value=0), \
+                 patch.object(core, 'finalize_recorded_clip'), \
+                 patch('object_detection.ObjectClipRecorder', return_value=recorder) as recorder_class, \
+                 patch.object(core.time, 'monotonic', side_effect=lambda: clock[0]):
+                core.run_detection('rtsp://test', 'camera', set(), lambda: clock[0] >= 26,
+                                   object_detector=MagicMock(), motion_algorithm='background',
+                                   motion_record_interval_seconds=10)
+            self.assertEqual(starts, [1, 11, 21])
+            self.assertGreaterEqual(recorder.observe.call_count, 25)
+            self.assertTrue(all(call.args[2] for call in recorder.observe.call_args_list))
+            self.assertIsInstance(recorder_class.call_args.args[5], core.MotionPreRoll)
+            self.assertEqual(recorder_class.call_args.args[5].seconds, core.MOTION_PREROLL_SECONDS)
 
     def test_motion_clip_finalization_is_local_only(self):
         with patch.object(core, 'upload_clip_async') as upload, patch.object(core, 'log_trigger_step') as log:

@@ -142,6 +142,7 @@ class ClipReplay:
                     run_detection(str(path), 'Clip test - ' + worker.label, set(), self.stop_event.is_set,
                         motion_sensitivity=worker.sensitivity, excluded_areas=exclusions,
                         motion_algorithm=algorithm, object_detector=detector, object_source_id=source_id,
+                        motion_record_interval_seconds=worker.motion_record_interval_seconds,
                         replay={'path': path, 'recorded_at': recorded_at, 'motion_dir': path.parent/'motion',
                                 'object_dir': path.parent/'object'}, replay_progress_callback=progress,
                         replay_check_callback=checks)

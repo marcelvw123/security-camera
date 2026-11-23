@@ -8,6 +8,12 @@ Select up to four cameras in the console and set sensitivity and exclusion areas
 
 For remote support, enable Raspberry Pi Connect and link it to the owner's Raspberry Pi account with `rpi-connect signin`. Keep lingering enabled so remote shell works after reboot. Follow the official Raspberry Pi Connect documentation for account linking and troubleshooting.
 
+## Motion recording interval
+
+Each running camera has a **Motion clips** setting. The default is 120 seconds between motion-only clip starts. In limited mode each clip records 20 seconds plus up to three seconds of pre-trigger frames, even if motion continues; another motion clip can start when the interval has passed. Set a whole number from 20 to 3600 seconds, or set 0 to restore continuous recording until motion has been quiet for the configured quiet period. Preferences remain saved if a camera is stopped and started again.
+
+This setting changes motion recordings only. Motion checks and object/scenario detection continue during the interval, and an independently triggered object clip can overlap with or start between motion clips. The shared pre-trigger buffer remains available for object clips. A missed object may not have a motion clip during the interval.
+
 ## Archive and review
 
 Install and verify the API archive endpoints and the `011_create_media_archive.sql` migration before setting `MEDIA_ARCHIVE_ENABLED=true`. A single background worker archives completed motion clips, object clips, and detection images. It streams files and asks the API to check the Azure blob's stored size and MD5 before deleting an unchanged local file. Its SQLite queue survives a restart and retries failures; local files stay in place if upload or verification fails. Detection metadata is stored in SQL with the media record. An interrupted recording is marked as such on the next startup.

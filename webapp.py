@@ -35,6 +35,7 @@ from motion_clip_metadata import load_metadata, title_for_metadata
 from security_camera_core import (
     DEFAULT_RTSP_PATH_TEMPLATE,
     DEFAULT_RTSP_PORT,
+    DEFAULT_MOTION_RECORD_INTERVAL_SECONDS,
     OUTPUT_DIR,
     OBJECT_OUTPUT_DIR,
     build_rtsp_url,
@@ -49,6 +50,35 @@ EXCLUSIONS_FILE = Path(__file__).resolve().parent / "motion_exclusions.json"
 EXCLUSIONS_LOCK = threading.RLock()
 VEHICLE_AREAS_FILE = Path(__file__).resolve().parent / "vehicle_detection_areas.json"
 VEHICLE_AREAS_LOCK = threading.RLock()
+MOTION_INTERVALS_FILE = Path(__file__).resolve().parent / 'motion_record_intervals.json'
+MOTION_INTERVALS_LOCK = threading.RLock()
+
+
+def load_motion_record_intervals():
+    with MOTION_INTERVALS_LOCK:
+        if not MOTION_INTERVALS_FILE.exists():
+            return {}
+        data = json.loads(MOTION_INTERVALS_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError('Invalid motion clip interval settings')
+        return {source: parse_motion_record_interval(value) for source, value in data.items()}
+
+
+def save_motion_record_interval(source_id, interval):
+    with MOTION_INTERVALS_LOCK:
+        data = load_motion_record_intervals()
+        data[source_id] = parse_motion_record_interval(interval)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', dir=MOTION_INTERVALS_FILE.parent, prefix='.motion_intervals_', delete=False) as out:
+                temporary = out.name
+                json.dump(data, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, MOTION_INTERVALS_FILE)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def load_vehicle_areas():
@@ -149,6 +179,7 @@ class WorkerState:
     kind: str
     sensitivity: int = 5
     motion_algorithm: str = "difference"
+    motion_record_interval_seconds: int = DEFAULT_MOTION_RECORD_INTERVAL_SECONDS
     status: str = "starting"
     object_recording: bool = False
     object_error: bool = False
@@ -219,6 +250,7 @@ class WebAppState:
                     "kind": worker.kind,
                     "sensitivity": worker.sensitivity,
                     "motion_algorithm": worker.motion_algorithm,
+                    "motion_record_interval_seconds": worker.motion_record_interval_seconds,
                     "status": worker.status,
                     "frame_age_seconds": round(max(0, time.monotonic() - worker.last_frame_at), 1),
                     "recording": worker.status.startswith("Recording clip:"),
@@ -321,6 +353,14 @@ def parse_sensitivity(value):
     return max(1, min(parsed, 10))
 
 
+def parse_motion_record_interval(value):
+    if value is None:
+        return DEFAULT_MOTION_RECORD_INTERVAL_SECONDS
+    if isinstance(value, bool) or not isinstance(value, int) or (value != 0 and not 20 <= value <= 3600):
+        raise ValueError('Motion clip interval must be 0 (unlimited) or 20–3600 seconds.')
+    return value
+
+
 def update_frame(worker, frame_bytes):
     with worker.condition:
         worker.frame = frame_bytes
@@ -381,6 +421,7 @@ def run_camera_worker(worker, stream, settings, sensitivity, excluded_areas=None
             object_source_id=worker.source_id,
             object_result_callback=worker.record_objects,
             heartbeat_callback=lambda now: setattr(worker, 'last_frame_at', now),
+            motion_record_interval_provider=lambda: worker.motion_record_interval_seconds,
         )
     except Exception as exc:
         logging.exception("Browser stream failed: %s", worker.label)
@@ -400,6 +441,8 @@ def start_camera(payload, restore=False):
     if not stream.stream_id:
         raise ValueError("stream_id is required")
     sensitivity = parse_sensitivity(payload.get("sensitivity"))
+    saved_interval = load_motion_record_intervals().get(stream.stream_id)
+    record_interval = parse_motion_record_interval(saved_interval if saved_interval is not None else payload.get("motion_record_interval_seconds"))
     algorithm = payload.get("motion_algorithm", "difference")
     if algorithm not in ("difference", "background"):
         raise ValueError("Invalid motion detection method.")
@@ -410,7 +453,7 @@ def start_camera(payload, restore=False):
     vehicle_area = load_vehicle_areas().get(stream.stream_id, LocalVehicleVerifier.default_crop(stream.stream_id))
     worker = WorkerState(source_id=stream.stream_id, label=stream.label, stop_event=threading.Event(),
                          thread=None, kind="camera", sensitivity=sensitivity, motion_algorithm=algorithm,
-                         excluded_areas=exclusions, vehicle_area=vehicle_area)
+                         motion_record_interval_seconds=record_interval, excluded_areas=exclusions, vehicle_area=vehicle_area)
     worker.thread = threading.Thread(target=run_camera_worker,
         args=(worker, stream, settings, sensitivity, exclusions, algorithm), daemon=True)
     # Hold the state lock while checking intent, so a stop cannot race a restore.
@@ -421,7 +464,8 @@ def start_camera(payload, restore=False):
             raise ValueError("Camera is already running")
         if not restore:
             CAMERA_REGISTRY.put(stream.stream_id, {"stream": stream_to_json(stream), "settings": settings,
-                "sensitivity": sensitivity, "motion_algorithm": algorithm})
+                "sensitivity": sensitivity, "motion_algorithm": algorithm,
+                "motion_record_interval_seconds": record_interval})
         APP_STATE.add_worker(worker)
         try:
             if OBJECT_DETECTOR and isinstance(OBJECT_DETECTOR.remote_shadow, LocalVehicleVerifier):
@@ -754,6 +798,8 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             return self.handle_stream_start()
         if parsed.path == "/api/stream/stop":
             return self.handle_stream_stop()
+        if parsed.path == "/api/stream/recording-interval":
+            return self.handle_recording_interval()
         if parsed.path == "/api/stream/exclusions":
             return self.handle_stream_exclusions()
         if parsed.path == "/api/stream/vehicle-area":
@@ -825,6 +871,31 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
             logging.exception("Could not persist camera selection")
             return self.send_json({"error": "Could not save camera selection."}, HTTPStatus.INTERNAL_SERVER_ERROR)
         self.send_json({"worker": {"source_id": worker.source_id, "label": worker.label}})
+
+    def handle_recording_interval(self):
+        payload = self.read_json()
+        source_id = str(payload.get('source_id', '')).strip()
+        try:
+            interval = parse_motion_record_interval(payload.get('interval_seconds'))
+            if payload.get('interval_seconds') is None:
+                raise ValueError('An interval is required.')
+            with APP_STATE.lock:
+                worker = APP_STATE.get_worker(source_id)
+                if worker is None:
+                    return self.send_json({'error': 'Camera is not running.'}, HTTPStatus.NOT_FOUND)
+                selected = CAMERA_REGISTRY.read().get(source_id)
+                if selected is None:
+                    raise ValueError('Camera settings are not available.')
+                save_motion_record_interval(source_id, interval)
+                selected['motion_record_interval_seconds'] = interval
+                CAMERA_REGISTRY.put(source_id, selected)
+                worker.motion_record_interval_seconds = interval
+            return self.send_json({'source_id': source_id, 'interval_seconds': interval})
+        except ValueError as exc:
+            return self.send_json({'error': str(exc)}, HTTPStatus.BAD_REQUEST)
+        except OSError:
+            logging.exception('Could not save motion clip interval')
+            return self.send_json({'error': 'Could not save motion clip interval.'}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def handle_stream_exclusions(self):
         payload = self.read_json()
@@ -1227,6 +1298,8 @@ INDEX_HTML = r"""<!doctype html>
       background: #101820;
       border-radius: 6px;
     }
+    dialog.interval-dialog { width: min(calc(100vw - 24px), 460px); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+    dialog.interval-dialog::backdrop { background: rgba(0,0,0,.65); }
     dialog.zone-dialog { width: min(calc(100vw - 24px), 1000px); max-width: calc(100vw - 24px); max-height: 94vh; border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
     dialog.zone-dialog::backdrop { background: rgba(0,0,0,.65); }
     .zone-stage { position: relative; width: fit-content; max-width: 100%; margin: auto; line-height: 0; background: #101820; }
@@ -1489,6 +1562,14 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
   </main>
+  <dialog id="motionIntervalDialog" class="interval-dialog" aria-labelledby="motionIntervalTitle">
+    <h2 id="motionIntervalTitle">Motion clip interval</h2>
+    <p class="status">Time between motion clip starts. Motion and object detection continue throughout. Enter 0 to record continuously while motion persists.</p>
+    <label for="motionIntervalInput">Seconds (0, or 20–3600)</label>
+    <input id="motionIntervalInput" type="number" min="0" max="3600" step="1">
+    <div id="motionIntervalStatus" class="status" role="status"></div>
+    <div class="actions"><button id="motionIntervalCancel" type="button" class="secondary">Cancel</button><button id="motionIntervalSave" type="button">Save</button></div>
+  </dialog>
   <dialog id="zoneDialog" class="zone-dialog" aria-labelledby="zoneTitle">
     <h2 id="zoneTitle">Draw excluded areas</h2>
     <p id="zoneHelp" class="zone-help">Drag on the image to add rectangles. All motion inside a shaded area is ignored, including people and vehicles.</p>
@@ -1596,7 +1677,7 @@ INDEX_HTML = r"""<!doctype html>
       `).join("");
     }
 
-    function addPreview(sourceId, label, previewEnabled = true, excludedAreas = [], recording = false, status = "", objectRecording = false, objectStatus = "disabled", sensitivity = null, vehicleArea = [0,0,1,1], objectProcessing = false, detectedObjects = []) {
+    function addPreview(sourceId, label, previewEnabled = true, excludedAreas = [], recording = false, status = "", objectRecording = false, objectStatus = "disabled", sensitivity = null, vehicleArea = [0,0,1,1], objectProcessing = false, detectedObjects = [], motionRecordInterval = 120) {
       const existing = state.previews.get(sourceId);
       if (existing) {
         existing.label = label;
@@ -1610,8 +1691,9 @@ INDEX_HTML = r"""<!doctype html>
         existing.vehicleArea = vehicleArea;
         existing.objectProcessing = objectProcessing;
         existing.detectedObjects = detectedObjects;
+        existing.motionRecordInterval = motionRecordInterval;
       } else {
-        state.previews.set(sourceId, { sourceId, label, previewEnabled, excludedAreas, recording, status, objectRecording, objectStatus, sensitivity, vehicleArea, objectProcessing, detectedObjects });
+        state.previews.set(sourceId, { sourceId, label, previewEnabled, excludedAreas, recording, status, objectRecording, objectStatus, sensitivity, vehicleArea, objectProcessing, detectedObjects, motionRecordInterval });
       }
       renderPreviews();
     }
@@ -1638,6 +1720,7 @@ INDEX_HTML = r"""<!doctype html>
               </button>
               ${preview.previewEnabled ? `<button class="secondary" data-zone-id="${encodeURIComponent(preview.sourceId)}">Excluded areas</button>` : ""}
               ${preview.previewEnabled ? `<button class="secondary" data-vehicle-zone-id="${encodeURIComponent(preview.sourceId)}">Vehicle area</button>` : ""}
+              <button class="secondary" data-motion-interval-id="${encodeURIComponent(preview.sourceId)}">Motion clips: ${preview.motionRecordInterval ? `${escapeHtml(String(preview.motionRecordInterval))}s` : 'unlimited'}</button>
               <button class="danger" data-stop-id="${encodeURIComponent(preview.sourceId)}">Stop</button>
             </div>
           </div>
@@ -1996,6 +2079,35 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
 
+    let intervalCamera = null;
+    function openMotionInterval(sourceId) {
+      const preview = state.previews.get(sourceId);
+      if (!preview) return;
+      intervalCamera = sourceId;
+      $('motionIntervalTitle').textContent = `Motion clip interval — ${preview.label}`;
+      $('motionIntervalInput').value = preview.motionRecordInterval ?? 120;
+      $('motionIntervalStatus').textContent = '';
+      $('motionIntervalDialog').showModal();
+    }
+    $('motionIntervalCancel').addEventListener('click', () => $('motionIntervalDialog').close());
+    $('motionIntervalSave').addEventListener('click', async () => {
+      const rawValue = $('motionIntervalInput').value.trim();
+      const value = Number(rawValue);
+      if (!rawValue || !Number.isInteger(value) || (value !== 0 && (value < 20 || value > 3600))) {
+        $('motionIntervalStatus').textContent = 'Enter 0, or a whole number from 20 to 3600.';
+        return;
+      }
+      $('motionIntervalSave').disabled = true;
+      try {
+        const data = await jsonFetch('/api/stream/recording-interval', {source_id:intervalCamera, interval_seconds:value});
+        const preview = state.previews.get(intervalCamera);
+        if (preview) preview.motionRecordInterval = data.interval_seconds;
+        $('motionIntervalDialog').close();
+        renderPreviews();
+      } catch (error) { $('motionIntervalStatus').textContent = error.message; }
+      finally { $('motionIntervalSave').disabled = false; }
+    });
+
     async function stopSource(sourceId) {
       await jsonFetch("/api/stream/stop", { source_id: sourceId });
       removePreview(sourceId);
@@ -2033,7 +2145,7 @@ INDEX_HTML = r"""<!doctype html>
         if (data.workers.some(worker => worker.source_id === selectedCamera)) cameraSelect.value = selectedCamera;
         const activeIds = new Set(data.workers.map((worker) => worker.source_id));
         for (const worker of data.workers) {
-          addPreview(worker.source_id, worker.label, worker.preview_enabled, worker.excluded_areas || [], worker.recording, worker.status, worker.object_recording, worker.object_detection_status, worker.sensitivity, worker.vehicle_area, worker.object_processing, worker.detected_objects || []);
+          addPreview(worker.source_id, worker.label, worker.preview_enabled, worker.excluded_areas || [], worker.recording, worker.status, worker.object_recording, worker.object_detection_status, worker.sensitivity, worker.vehicle_area, worker.object_processing, worker.detected_objects || [], worker.motion_record_interval_seconds);
         }
         for (const sourceId of Array.from(state.previews.keys())) {
           if (!activeIds.has(sourceId)) state.previews.delete(sourceId);
@@ -2186,12 +2298,14 @@ INDEX_HTML = r"""<!doctype html>
       const mediaFolder = event.target.dataset.mediaFolder;
       const zoneId = event.target.dataset.zoneId;
       const vehicleZoneId = event.target.dataset.vehicleZoneId;
+      const intervalId = event.target.dataset.motionIntervalId;
       if (startIndex !== undefined) startStream(Number(startIndex));
       if (stopId !== undefined) stopSource(decodeURIComponent(stopId));
       if (previewId !== undefined) setPreviewEnabled(decodeURIComponent(previewId), previewEnabled === "1");
       if (mediaFolder !== undefined) loadMedia(mediaFolder);
       if (zoneId !== undefined) openZoneEditor(decodeURIComponent(zoneId));
       if (vehicleZoneId !== undefined) openZoneEditor(decodeURIComponent(vehicleZoneId), 'vehicle');
+      if (intervalId !== undefined) openMotionInterval(decodeURIComponent(intervalId));
     });
 
     loadDefaults();
