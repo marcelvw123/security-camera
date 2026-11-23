@@ -1116,7 +1116,8 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
+      flex-wrap: wrap;
+      gap: 10px 16px;
       padding: 14px 18px;
       border-bottom: 1px solid var(--line);
       background: #fbfcfd;
@@ -1129,7 +1130,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     main {
       display: grid;
-      grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: 14px;
       padding: 14px;
     }
@@ -1305,6 +1306,9 @@ INDEX_HTML = r"""<!doctype html>
       background: #101820;
       border-radius: 6px;
     }
+    dialog.connection-dialog { width: min(calc(100vw - 24px), 500px); max-height: 90vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+    dialog.connection-dialog::backdrop { background: rgba(0,0,0,.65); }
+    dialog.connection-dialog .status { min-height: 0; margin-top: 8px; }
     dialog.interval-dialog { width: min(calc(100vw - 24px), 460px); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
     dialog.interval-dialog::backdrop { background: rgba(0,0,0,.65); }
     dialog.zone-dialog { width: min(calc(100vw - 24px), 1000px); max-width: calc(100vw - 24px); max-height: 94vh; border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
@@ -1498,38 +1502,10 @@ INDEX_HTML = r"""<!doctype html>
     <div id="connectionStatus">Idle</div>
     <div id="healthStatus" role="status"></div>
     <a href="/api/diagnostics/export">Download diagnostics</a>
+    <button id="connectionOpen" class="secondary" type="button">Connection settings</button>
   </header>
 
   <main>
-    <div class="stack">
-      <section>
-        <h2>Connection</h2>
-        <label for="username">Username</label>
-        <input id="username" autocomplete="username">
-        <label for="password">Password</label>
-        <input id="password" type="password" autocomplete="current-password">
-        <div class="row">
-          <div>
-            <label for="ipAddress">DVR/NVR IP</label>
-            <input id="ipAddress">
-          </div>
-          <div>
-            <label for="port">RTSP Port</label>
-            <input id="port">
-          </div>
-        </div>
-        <label for="rtspTemplate">RTSP Path Template</label>
-        <input id="rtspTemplate">
-        <div class="actions">
-          <button id="scanButton">Connect</button>
-          <button id="manualButton" class="secondary">Add Manual Channel</button>
-        </div>
-        <label for="manualChannel">Manual Channel</label>
-        <input id="manualChannel" placeholder="101">
-      </section>
-
-    </div>
-
     <div class="stack">
       <section>
         <h2>Streams</h2>
@@ -1567,6 +1543,32 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
   </main>
+  <dialog id="connectionDialog" class="connection-dialog" aria-labelledby="connectionTitle">
+    <div class="section-head"><h2 id="connectionTitle">Connection settings</h2><button id="connectionClose" class="secondary" type="button">Close</button></div>
+        <label for="username">Username</label>
+        <input id="username" autocomplete="username">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password">
+        <div class="row">
+          <div>
+            <label for="ipAddress">DVR/NVR IP</label>
+            <input id="ipAddress">
+          </div>
+          <div>
+            <label for="port">RTSP Port</label>
+            <input id="port">
+          </div>
+        </div>
+        <label for="rtspTemplate">RTSP Path Template</label>
+        <input id="rtspTemplate">
+        <div class="actions">
+          <button id="scanButton">Connect</button>
+          <button id="manualButton" class="secondary">Add Manual Channel</button>
+        </div>
+        <label for="manualChannel">Manual Channel</label>
+        <input id="manualChannel" placeholder="101">
+    <div id="connectionMessage" class="status" role="status"></div>
+  </dialog>
   <dialog id="motionIntervalDialog" class="interval-dialog" aria-labelledby="motionIntervalTitle">
     <h2 id="motionIntervalTitle">Motion clip interval</h2>
     <p class="status">Time between motion clip starts. Motion and object detection continue throughout. Enter 0 to record continuously while motion persists.</p>
@@ -1860,6 +1862,7 @@ INDEX_HTML = r"""<!doctype html>
     async function scanStreams() {
       $("scanButton").disabled = true;
       $("scanStatus").textContent = "Connecting: trying ONVIF discovery, then RTSP probing...";
+      $("connectionMessage").textContent = "Searching for cameras…";
       setStatus("Scanning");
       try {
         const data = await jsonFetch("/api/scan", { settings: settings() });
@@ -1871,8 +1874,11 @@ INDEX_HTML = r"""<!doctype html>
         }
         renderStreams();
         saveState();
+        $("connectionMessage").textContent = data.streams.length ? `Found ${data.streams.length} stream(s).` : "No streams found. You can add a manual channel below.";
+        if (data.streams.length) $("connectionDialog").close();
         setStatus("Ready");
       } catch (error) {
+        $("connectionMessage").textContent = error.message;
         $("scanStatus").textContent = error.message;
         setStatus("Error");
       } finally {
@@ -1884,6 +1890,7 @@ INDEX_HTML = r"""<!doctype html>
       const channel = $("manualChannel").value.trim();
       if (!channel) {
         $("scanStatus").textContent = "Enter a manual channel first.";
+        $("connectionMessage").textContent = "Enter a manual channel first.";
         return;
       }
       const label = `Manual Channel (${channel})`;
@@ -1897,6 +1904,7 @@ INDEX_HTML = r"""<!doctype html>
       });
       $("manualChannel").value = "";
       $("scanStatus").textContent = "Manual channel added. Start it from the stream list.";
+      $("connectionDialog").close();
       renderStreams();
       saveState();
     }
@@ -2276,6 +2284,8 @@ INDEX_HTML = r"""<!doctype html>
       } catch (error) { alert(error.message); button.disabled = false; }
     });
     $('loadMoreMedia').addEventListener('click', () => { if (state.mediaHasMore) loadMedia(state.activeMediaFolder, state.mediaPage + 1); });
+    $("connectionOpen").addEventListener("click", () => { $("connectionMessage").textContent = ""; $("connectionDialog").showModal(); });
+    $("connectionClose").addEventListener("click", () => $("connectionDialog").close());
     $("scanButton").addEventListener("click", scanStreams);
     $("manualButton").addEventListener("click", addManualChannel);
     $("refreshLogsButton").addEventListener("click", loadLogs);
