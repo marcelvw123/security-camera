@@ -812,9 +812,16 @@ class SecurityCameraWebHandler(BaseHTTPRequestHandler):
         import shutil
         params = parse_qs(parsed.query)
         source_id = params.get('camera', [''])[0]
-        worker = APP_STATE.get_worker(source_id)
-        if worker is None:
-            return self.send_json({'error': 'Choose a running camera.'}, HTTPStatus.BAD_REQUEST)
+        if source_id:
+            worker = APP_STATE.get_worker(source_id)
+            if worker is None:
+                return self.send_json({'error': 'Camera is not running.'}, HTTPStatus.BAD_REQUEST)
+        else:
+            # Uploaded tests use neutral defaults, not another camera's private zones.
+            worker = WorkerState(source_id='test-default', label='Default test settings',
+                                 stop_event=threading.Event(), thread=None, kind='test',
+                                 sensitivity=DEFAULT_MOTION_SENSITIVITY, motion_algorithm='difference',
+                                 excluded_areas=[], vehicle_area=[0, 0, 1, 1])
         if OBJECT_DETECTOR is None or OBJECT_DETECTOR.health() not in ('ready', 'degraded'):
             return self.send_json({'error': 'Object detection is not ready.'}, HTTPStatus.SERVICE_UNAVAILABLE)
         try:
@@ -1537,9 +1544,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <section>
         <h2>Test an image or clip</h2>
-        <p class="status">Choose where to start. Motion needs video; object and scenario tests skip motion. Scenario testing first identifies objects in the image. No WhatsApp is sent. Videos run at recording speed and may slow live detection. Test files stay on this Pi, separate from the live archive.</p>
-        <label for="clipTestCamera">Camera settings</label>
-        <select id="clipTestCamera"><option value="">Choose a running camera</option></select>
+        <p class="status">Tests use default motion settings (sensitivity 5, no excluded areas). Choose where to start. Motion needs video; object and scenario tests skip motion. Scenario testing first identifies objects in the image. No WhatsApp is sent. Videos run at recording speed and may slow live detection. Test files stay on this Pi, separate from the live archive.</p>
         <label for="clipTestStage">Start at</label>
         <select id="clipTestStage"><option value="motion">Motion → Object → Scenario (video only)</option><option value="object">Object → Scenario</option><option value="scenario">Scenario (with object detection)</option></select>
         <label for="clipTestTime">When was the image or clip recorded? (South Africa time)</label>
@@ -2138,11 +2143,6 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const response = await fetch("/api/workers");
         const data = await response.json();
-        const cameraSelect = $('clipTestCamera');
-        const selectedCamera = cameraSelect.value;
-        cameraSelect.innerHTML = '<option value="">Choose a running camera</option>' + data.workers.map(worker =>
-          `<option value="${escapeAttribute(worker.source_id)}">${escapeHtml(worker.label)} (sensitivity ${worker.sensitivity})</option>`).join('');
-        if (data.workers.some(worker => worker.source_id === selectedCamera)) cameraSelect.value = selectedCamera;
         const activeIds = new Set(data.workers.map((worker) => worker.source_id));
         for (const worker of data.workers) {
           addPreview(worker.source_id, worker.label, worker.preview_enabled, worker.excluded_areas || [], worker.recording, worker.status, worker.object_recording, worker.object_detection_status, worker.sensitivity, worker.vehicle_area, worker.object_processing, worker.detected_objects || [], worker.motion_record_interval_seconds);
@@ -2166,13 +2166,14 @@ INDEX_HTML = r"""<!doctype html>
       const progress = job.duration ? `${Math.round(job.position)} / ${Math.round(job.duration)} seconds` : `${Math.round(job.position)} seconds`;
       $('clipTestStatus').textContent = `Test ${job.status} · started at ${job.stage || 'motion'} · ${progress} · ${job.motion_checks} motion checks · ${job.object_checks} object checks${job.error ? ` · ${job.error}` : ''}`;
       $('clipTestStart').disabled = ['uploading', 'running'].includes(job.status);
+      const detailsWereOpen = Boolean($('clipTestResults').querySelector('.clip-test-checks')?.open);
       const files = (job.files || []).map(file => `<a href="${escapeAttribute(file.url)}" target="_blank" rel="noreferrer">${escapeHtml(file.kind)}: ${escapeHtml(file.name)}</a>`).join('');
       const checks = job.events || [];
       const labels = [...new Set(checks.flatMap(event => event.objects || []))];
       const matches = checks.flatMap(event => event.scenarios || []);
       const summary = job.object_checks ? `Objects: ${labels.length ? labels.join(', ') : 'none identified'} · Scenario matches: ${matches.length}` : 'No object checks yet';
       const events = checks.map(event => `<div class="clip-meta">${event.captured_at ? escapeHtml(formatDateTime(event.captured_at)) : 'Time unavailable'}: ${escapeHtml((event.objects || []).join(', ') || 'no objects')}${(event.scenarios || []).length ? ` · Rule: ${escapeHtml(event.scenarios.map(x => x.reason).join('; '))}` : ''}${(event.decisions || []).length ? ` · ${escapeHtml([...new Set(event.decisions)].join('; '))}` : ''}</div>`).join('');
-      $('clipTestResults').innerHTML = `<div class="clip-meta">${escapeHtml(summary)}</div>${files ? `<div class="clip-actions">${files}</div>` : ''}${events ? `<details class="evidence-details"><summary>Object check details (${checks.length})</summary>${events}</details>` : ''}`;
+      $('clipTestResults').innerHTML = `<div class="clip-meta">${escapeHtml(summary)}</div>${files ? `<div class="clip-actions">${files}</div>` : ''}${events ? `<details class="evidence-details clip-test-checks" ${detailsWereOpen ? 'open' : ''}><summary>Object check details (${checks.length})</summary>${events}</details>` : ''}`;
     }
     async function pollClipTest() {
       try {
@@ -2188,14 +2189,14 @@ INDEX_HTML = r"""<!doctype html>
       if (isImage && $('clipTestStage').value === 'motion') $('clipTestStage').value = 'object';
     });
     $('clipTestStart').addEventListener('click', async () => {
-      const file = $('clipTestFile').files[0], camera = $('clipTestCamera').value, recorded = $('clipTestTime').value;
-      if (!file || !camera || !recorded) { $('clipTestStatus').textContent = 'Choose a camera, recording time and file.'; return; }
+      const file = $('clipTestFile').files[0], recorded = $('clipTestTime').value;
+      if (!file || !recorded) { $('clipTestStatus').textContent = 'Choose a recording time and file.'; return; }
       const isImage = /\.(jpe?g|png)$/i.test(file.name);
       if (file.size > (isImage ? 25 : 250) * 1024 * 1024) { $('clipTestStatus').textContent = isImage ? 'The image must be 25 MB or smaller.' : 'The video must be 250 MB or smaller.'; return; }
       $('clipTestStart').disabled = true;
       $('clipTestStatus').textContent = 'Uploading clip…';
       try {
-        const query = new URLSearchParams({camera, recorded_at:recorded, filename:file.name, stage:$('clipTestStage').value});
+        const query = new URLSearchParams({recorded_at:recorded, filename:file.name, stage:$('clipTestStage').value});
         const response = await fetch(`/api/clip-test?${query}`, {method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Clip upload failed.');

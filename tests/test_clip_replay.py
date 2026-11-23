@@ -132,6 +132,27 @@ class ClipTestUploadTests(unittest.TestCase):
                 self.assertEqual(start.call_args.args[2],worker)
                 self.assertEqual(handler.send_json.call_args.args[1],202)
 
+    def test_upload_uses_neutral_defaults_without_camera_selection(self):
+        import io
+        from urllib.parse import urlparse
+        import webapp
+        with tempfile.TemporaryDirectory() as directory:
+            manager=ClipReplay(directory)
+            detector=MagicMock();detector.health.return_value='ready';detector.remote_shadow=None
+            handler=MagicMock();handler.headers={'Content-Length':'5'};handler.rfile=io.BytesIO(b'video')
+            with patch.object(webapp,'CLIP_REPLAY',manager), patch.object(webapp,'OBJECT_DETECTOR',detector), \
+                 patch.object(webapp.APP_STATE,'get_worker') as get_worker, \
+                 patch('shutil.disk_usage',return_value=MagicMock(free=10_000_000_000)), \
+                 patch.object(manager,'start') as start:
+                webapp.SecurityCameraWebHandler.handle_clip_test(handler,urlparse('/api/clip-test?filename=clip.mp4&recorded_at=2026-11-20T22%3A15'))
+                get_worker.assert_not_called()
+                worker=start.call_args.args[2]
+                self.assertEqual(worker.sensitivity,5)
+                self.assertEqual(worker.motion_algorithm,'difference')
+                self.assertEqual(worker.current_exclusions(),[])
+                self.assertEqual(worker.current_vehicle_area(),[0,0,1,1])
+                self.assertEqual(handler.send_json.call_args.args[1],202)
+
     def test_rejects_large_or_unknown_file_without_starting_job(self):
         from urllib.parse import urlparse
         import webapp
